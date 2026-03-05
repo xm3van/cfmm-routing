@@ -156,7 +156,6 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
             },
         )
 
-    status = str(prob.status)
     if prob.value is None or status not in ("optimal", "optimal_inaccurate"):
         spent = float(-psi.value[in_asset]) if psi.value is not None else 0.0
         return FlowResult(
