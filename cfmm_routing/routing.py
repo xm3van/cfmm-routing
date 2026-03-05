@@ -10,6 +10,9 @@ from cfmm_routing.config import RoutingConfig, PoolSpec
 from cfmm_routing.market import Market
 
 
+_CONIC_FALLBACK_SOLVERS: Tuple[str, ...] = ("CLARABEL", "SCS", "ECOS")
+
+
 @dataclass
 class FlowResult:
     status: str
@@ -121,9 +124,25 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
 
     prob = cp.Problem(obj, cons)
 
-    try:
-        prob.solve(solver=rcfg.solver, **rcfg.solver_opts)
-    except Exception as e:
+    solve_errors: List[Dict[str, str]] = []
+    selected_solver = rcfg.solver
+    solvers_to_try: List[str] = [selected_solver]
+
+    # OSQP can't solve this cone program; keep backward compatibility by
+    # trying a conic-capable solver when available.
+    if selected_solver == "OSQP":
+        for s in _CONIC_FALLBACK_SOLVERS:
+            if s not in solvers_to_try:
+                solvers_to_try.append(s)
+
+    for solver in solvers_to_try:
+        selected_solver = solver
+        try:
+            prob.solve(solver=solver, **rcfg.solver_opts)
+            break
+        except Exception as e:
+            solve_errors.append({"solver": solver, "exception": repr(e)})
+    else:
         return FlowResult(
             status="error",
             dy_total=0.0,
@@ -131,8 +150,9 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
             pool_out_to_sink={},
             solver_info={
                 "cvxpy_status": "error",
-                "solver": rcfg.solver,
-                "exception": repr(e),
+                "solver": selected_solver,
+                "attempted_solvers": solvers_to_try,
+                "exceptions": solve_errors,
             },
         )
 
@@ -146,8 +166,10 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
             pool_out_to_sink={},
             solver_info={
                 "cvxpy_status": status,
-                "solver": rcfg.solver,
+                "solver": selected_solver,
+                "attempted_solvers": solvers_to_try,
                 "spent": spent,
+                "exceptions": solve_errors,
             },
         )
 
@@ -180,8 +202,10 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
         pool_out_to_sink=pool_out_to_sink,
         solver_info={
             "cvxpy_status": status,
-            "solver": rcfg.solver,
+            "solver": selected_solver,
+            "attempted_solvers": solvers_to_try,
             "spent": spent,
             "received": received,
+            "exceptions": solve_errors,
         },
     )
