@@ -83,6 +83,13 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
             solver_info={"reason": "no pools"},
         )
 
+    # Homogeneous scaling improves conditioning for conic solvers when
+    # reserves/endowment are very large (common in on-chain units).
+    reserve_scale_candidates = [abs(float(dx_total))]
+    for p in pools:
+        reserve_scale_candidates.append(abs(float(p.liquidity)))
+    flow_scale = max(1.0, max(reserve_scale_candidates, default=1.0))
+
     local_assets_list: List[List[int]] = []
     A_list: List[np.ndarray] = []
     reserves_list: List[np.ndarray] = []
@@ -99,7 +106,7 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
             A_k[idx, t] = 1.0
         A_list.append(A_k)
 
-        reserves_list.append(_pool_reserves(p, local_assets))
+        reserves_list.append(_pool_reserves(p, local_assets) / flow_scale)
         gamma_list.append(_pool_gamma(p))
 
         deltas.append(cp.Variable(len(local_assets), nonneg=True))
@@ -114,7 +121,7 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
 
     # paper endowment constraint
     w = np.zeros(n, dtype=float)
-    w[in_asset] = float(dx_total)
+    w[in_asset] = float(dx_total) / flow_scale
     cons.append(psi + w >= 0)
 
     # pool constraints
@@ -126,30 +133,48 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
 
     solve_errors: List[Dict[str, str]] = []
     selected_solver = rcfg.solver
-    solvers_to_try: List[str] = [selected_solver]
 
-    # OSQP can't solve this cone program; keep backward compatibility by
-    # trying a conic-capable solver when available.
-    if selected_solver == "OSQP":
-        for s in _CONIC_FALLBACK_SOLVERS:
-            if s not in solvers_to_try:
-                solvers_to_try.append(s)
+    installed = set(cp.installed_solvers())
+    candidate_solvers: List[str] = [selected_solver]
 
+    # This model uses conic atoms (geo_mean), so OSQP is incompatible.
+    # Also, user environments often miss one or more optional solver packages.
+    # We therefore try other conic solvers deterministically as a fallback.
+    for s in _CONIC_FALLBACK_SOLVERS:
+        if s not in candidate_solvers:
+            candidate_solvers.append(s)
+
+    # Keep ordering stable but skip clearly unavailable backends.
+    solvers_to_try = [s for s in candidate_solvers if s in installed]
+    if not solvers_to_try:
+        solvers_to_try = candidate_solvers
+
+    status = "error"
     for solver in solvers_to_try:
         selected_solver = solver
         try:
             prob.solve(solver=solver, **rcfg.solver_opts)
-            break
         except Exception as e:
             solve_errors.append({"solver": solver, "exception": repr(e)})
+            continue
+
+        status = str(prob.status)
+        if prob.value is not None and status in ("optimal", "optimal_inaccurate"):
+            break
+
+        solve_errors.append({
+            "solver": solver,
+            "status": status,
+            "reason": "non_optimal_status",
+        })
     else:
         return FlowResult(
-            status="error",
+            status=status,
             dy_total=0.0,
             pool_in={},
             pool_out_to_sink={},
             solver_info={
-                "cvxpy_status": "error",
+                "cvxpy_status": status,
                 "solver": selected_solver,
                 "attempted_solvers": solvers_to_try,
                 "exceptions": solve_errors,
@@ -157,7 +182,7 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
         )
 
     if prob.value is None or status not in ("optimal", "optimal_inaccurate"):
-        spent = float(-psi.value[in_asset]) if psi.value is not None else 0.0
+        spent = float(-psi.value[in_asset] * flow_scale) if psi.value is not None else 0.0
         return FlowResult(
             status=status,
             dy_total=0.0,
@@ -173,8 +198,8 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
         )
 
     # compute spent/received AFTER solve
-    spent = float(-psi.value[in_asset]) if psi.value is not None else 0.0
-    received = float(psi.value[out_asset]) if psi.value is not None else 0.0
+    spent = float(-psi.value[in_asset] * flow_scale) if psi.value is not None else 0.0
+    received = float(psi.value[out_asset] * flow_scale) if psi.value is not None else 0.0
 
     pool_in: Dict[str, float] = {}
     pool_out_to_sink: Dict[str, float] = {}
@@ -184,12 +209,12 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
         Dv = np.array(D.value).astype(float) if D.value is not None else np.zeros(len(local_assets))
         Lv = np.array(L.value).astype(float) if L.value is not None else np.zeros(len(local_assets))
 
-        pool_in[uid] = float(np.sum(Dv))
+        pool_in[uid] = float(np.sum(Dv) * flow_scale)
 
         contrib = 0.0
         if out_asset in local_assets:
             t = local_assets.index(out_asset)
-            contrib = float(Lv[t] - Dv[t])
+            contrib = float((Lv[t] - Dv[t]) * flow_scale)
             if contrib < 0:
                 contrib = 0.0
         pool_out_to_sink[uid] = contrib
