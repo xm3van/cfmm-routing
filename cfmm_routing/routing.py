@@ -10,6 +10,37 @@ from cfmm_routing.config import RoutingConfig, PoolSpec
 from cfmm_routing.market import Market
 
 
+_CONIC_FALLBACK_SOLVERS: Tuple[str, ...] = ("CLARABEL", "SCS", "ECOS")
+
+
+def _ordered_solvers(primary: str) -> List[str]:
+    ordered = [primary]
+    for s in _CONIC_FALLBACK_SOLVERS:
+        if s not in ordered:
+            ordered.append(s)
+    return ordered
+
+
+def _solver_opts_for(solver: str, solver_opts: Dict[str, object]) -> Dict[str, object]:
+    # Keep options portable across fallback solvers.
+    opts = dict(solver_opts)
+
+    if solver == "SCS":
+        return opts
+
+    # SCS-only options should not be forwarded to other solvers.
+    for key in ("eps", "acceleration_lookback", "scale", "normalize", "rho_x"):
+        opts.pop(key, None)
+
+    # Clarabel expects max_iter (not max_iters).
+    if solver == "CLARABEL":
+        if "max_iters" in opts and "max_iter" not in opts:
+            opts["max_iter"] = opts.pop("max_iters")
+        opts.setdefault("max_iter", 1_000)
+
+    return opts
+
+
 @dataclass
 class FlowResult:
     status: str
@@ -121,9 +152,25 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
 
     prob = cp.Problem(obj, cons)
 
-    try:
-        prob.solve(solver=rcfg.solver, **rcfg.solver_opts)
-    except Exception as e:
+    solve_errors: List[Dict[str, str]] = []
+    selected_solver = rcfg.solver
+    solvers_to_try: List[str] = _ordered_solvers(selected_solver)
+
+    status = "error"
+    for solver in solvers_to_try:
+        selected_solver = solver
+        solver_opts = _solver_opts_for(solver, rcfg.solver_opts)
+        try:
+            prob.solve(solver=solver, **solver_opts)
+        except Exception as e:
+            solve_errors.append({"solver": solver, "exception": repr(e)})
+            continue
+
+        status = str(prob.status)
+        if status in ("optimal", "optimal_inaccurate"):
+            break
+
+    if status == "error":
         return FlowResult(
             status="error",
             dy_total=0.0,
@@ -131,12 +178,12 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
             pool_out_to_sink={},
             solver_info={
                 "cvxpy_status": "error",
-                "solver": rcfg.solver,
-                "exception": repr(e),
+                "solver": selected_solver,
+                "attempted_solvers": solvers_to_try,
+                "exceptions": solve_errors,
             },
         )
 
-    status = str(prob.status)
     if prob.value is None or status not in ("optimal", "optimal_inaccurate"):
         spent = float(-psi.value[in_asset]) if psi.value is not None else 0.0
         return FlowResult(
@@ -146,8 +193,10 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
             pool_out_to_sink={},
             solver_info={
                 "cvxpy_status": status,
-                "solver": rcfg.solver,
+                "solver": selected_solver,
+                "attempted_solvers": solvers_to_try,
                 "spent": spent,
+                "exceptions": solve_errors,
             },
         )
 
@@ -180,8 +229,10 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
         pool_out_to_sink=pool_out_to_sink,
         solver_info={
             "cvxpy_status": status,
-            "solver": rcfg.solver,
+            "solver": selected_solver,
+            "attempted_solvers": solvers_to_try,
             "spent": spent,
             "received": received,
+            "exceptions": solve_errors,
         },
     )
