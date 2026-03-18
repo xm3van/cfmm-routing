@@ -163,6 +163,14 @@ def main() -> int:
         return 1
 
     market_cfg = build_market_config_from_graph(G)
+    category_lookup = market_cfg.edge_category_by_pool_uid()
+    token_type_lookup = market_cfg.token_type_by_asset_id()
+
+    if len(token_type_lookup) != G.number_of_nodes():
+        raise RuntimeError("MarketConfig token type metadata did not include every graph node.")
+    if len(category_lookup) != G.number_of_edges():
+        raise RuntimeError("MarketConfig edge category metadata did not include every graph edge.")
+
     routing_cfg = RoutingConfig(
         solver="SCS",
         solver_opts={
@@ -195,6 +203,8 @@ def main() -> int:
         "edges": G.number_of_edges(),
         "stable_nodes": len(stable_nodes),
         "pairs_tested": len(pairs),
+        "asset_token_types": token_type_lookup,
+        "edge_categories_sample": dict(list(category_lookup.items())[:5]),
         "pair_results": results,
     }
     print(json.dumps(summary, indent=2))
