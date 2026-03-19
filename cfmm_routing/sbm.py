@@ -14,6 +14,23 @@ AMMType = str
 # A key describing an (ordered) (role_i, role_j, token_i, token_j) condition.
 AttrKey = Tuple[Role, Role, TokenType, TokenType]
 
+_CURVE_CATEGORY_DEFAULT_A: Dict[str, float] = {
+    "stable_stable": 1400.0,
+    "major_major": 220.0,
+    "mixed": 520.0,
+    "other": 120.0,
+}
+
+_CURVE_CATEGORY_SCALE: Dict[str, float] = {
+    "stable_stable": 30.0,
+    "major_major": 140.0,
+    "mixed": 90.0,
+    "other": 180.0,
+}
+
+_STABLE_TOKEN_TYPES = {"stable", "stablecoin", "usd", "usdc", "usdt", "dai", "frax", "lusd", "susd"}
+_MAJOR_TOKEN_TYPES = {"major", "bluechip", "btc", "eth", "wbtc", "weth", "sol", "bnb"}
+
 
 # -----------------------------
 # Utilities
@@ -69,6 +86,51 @@ def _call_sampler(
         return float(sampler(rng, ri, rj, ti, tj, amm))
     except TypeError:
         return float(sampler(ri, rj, ti, tj, amm))
+
+
+def _token_family(token_type: Any) -> str:
+    token = str(token_type).strip().lower()
+    if token in _STABLE_TOKEN_TYPES:
+        return "stable"
+    if token in _MAJOR_TOKEN_TYPES:
+        return "major"
+    return "other"
+
+
+def classify_curve_pair(token_i: Any, token_j: Any) -> str:
+    """Bucket token pairs into coarse categories for Curve proxy calibration."""
+    family_i = _token_family(token_i)
+    family_j = _token_family(token_j)
+    families = {family_i, family_j}
+
+    if families == {"stable"}:
+        return "stable_stable"
+    if families == {"major"}:
+        return "major_major"
+    if families == {"stable", "major"}:
+        return "mixed"
+    return "other"
+
+
+def curve_proxy_k_from_A(A: float, category: str) -> float:
+    """
+    Translate a StableSwap-style amplification A into the canonical concave Curve
+    proxy parameter k used by market and routing.
+
+    This is a calibrated proxy, not the exact Curve invariant: larger A implies
+    deeper near-peg liquidity, which we encode as smaller k.
+    """
+    A = float(A)
+    if not np.isfinite(A) or A <= 0.0:
+        raise ValueError("Curve amplification A must be positive and finite.")
+
+    scale = float(_CURVE_CATEGORY_SCALE.get(category, _CURVE_CATEGORY_SCALE["other"]))
+    k = scale / (scale + A)
+    return float(np.clip(k, 1e-3, 1.0))
+
+
+def default_curve_A_for_category(category: str) -> float:
+    return float(_CURVE_CATEGORY_DEFAULT_A.get(category, _CURVE_CATEGORY_DEFAULT_A["other"]))
 
 
 # -----------------------------
@@ -225,116 +287,66 @@ class EdgeAttributeModel:
             for rule in self.rules.values():
                 value = rule.sampler(i, j, G, rng)
                 G.edges[i, j][rule.name] = value
-                # if value is not None:
-                #     G.edges[i, j][rule.name] = value
 
         return G
-    
+
 
 from cfmm_routing.config import MarketConfig, PoolSpec
 
-# def build_market_config_from_sbm(
-#     sbm_generator: SBMGenerator,
-# ) -> MarketConfig:
-#     """
-#     Generate SBM graph and convert to MarketConfig.
-#     Assumes edges have attributes:
-#         - 'amm'
-#         - 'liquidity'
-#         - optionally 'fee'
-#         - optionally AMM-specific params
-#     """
-
-#     G = sbm_generator.generate()
-
-#     pools = []
-
-#     for idx, (i, j, data) in enumerate(G.edges(data=True)):
-
-#         # Required
-#         ptype = data.get("amm")
-#         liquidity = float(data.get("liquidity"))
-
-#         # Optional params
-#         params = {}
-
-#         # Fee
-#         if "fee" in data:
-#             params["fee"] = float(data["fee"])
-
-#         # Curve-style param
-#         # if "A" in data:
-#         #     params["A"] = float(data["A"])
-#         A = data.get("A")
-#         if A is not None:
-#             params["A"] = int(A)
-
-#         # Balancer-style params
-#         if "w_i" in data:
-#             params["w_i"] = float(data["w_i"])
-#         if "w_j" in data:
-#             params["w_j"] = float(data["w_j"])
-
-#         uid = f"{ptype}-{idx}:{i}-{j}"
-
-#         pools.append(
-#             PoolSpec(
-#                 uid=uid,
-#                 ptype=ptype,
-#                 i=int(i),
-#                 j=int(j),
-#                 liquidity=liquidity,
-#                 params=params,
-#             )
-#         )
-
-#     return MarketConfig(
-#         n_assets=G.number_of_nodes(),
-#         pools=tuple(pools),
-#     )
 
 def build_market_config_from_graph(
     G: nx.Graph,
 ) -> MarketConfig:
     """
-    Generate SBM graph and convert to MarketConfig.
-    Assumes edges have attributes:
-        - 'amm'
-        - 'liquidity'
-        - optionally 'fee'
-        - optionally AMM-specific params
+    Convert an attributed graph into MarketConfig.
+
+    Curve pools preserve amplification-style `A` as the primary research input.
+    A shared category-conditioned translation derives the proxy depth parameter
+    `k` when needed, and both are stored on pool params so pricing and routing
+    consume the same pool shape. This is intentionally not an exact StableSwap
+    invariant; it is a category-conditioned proxy used consistently by pricing
+    and routing.
     """
 
     pools = []
 
     for idx, (i, j, data) in enumerate(G.edges(data=True)):
-
-        # Required
         ptype = data.get("amm")
         liquidity = float(data.get("liquidity"))
-
-        # Optional params
         params = {}
 
-        # Fee
         if "fee" in data:
             params["fee"] = float(data["fee"])
 
-        # Curve-style param
-        # if "A" in data:
-        #     params["A"] = float(data["A"])
-        A = data.get("A")
-        if A is not None:
-            params["A"] = int(A)
+        if ptype == "curve":
+            token_i = data.get("token_type_i", G.nodes[i].get("token_type"))
+            token_j = data.get("token_type_j", G.nodes[j].get("token_type"))
+            category = str(data.get("curve_category") or classify_curve_pair(token_i, token_j))
 
-        # Balancer-style params
+            raw_A = data.get("A")
+            if raw_A is None:
+                raw_A = default_curve_A_for_category(category)
+
+            if "k" in data and data.get("k") is not None:
+                k = float(data["k"])
+            else:
+                k = curve_proxy_k_from_A(raw_A, category)
+
+            params.update(
+                {
+                    "A": float(raw_A),
+                    "k": float(k),
+                    "curve_category": category,
+                    "curve_model": "calibrated_stableswap_proxy_from_A",
+                }
+            )
+
         if "w_i" in data:
             params["w_i"] = float(data["w_i"])
         if "w_j" in data:
             params["w_j"] = float(data["w_j"])
 
         uid = f"{ptype}-{idx}:{i}-{j}"
-
         pools.append(
             PoolSpec(
                 uid=uid,

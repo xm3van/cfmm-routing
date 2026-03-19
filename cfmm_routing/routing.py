@@ -7,7 +7,7 @@ import numpy as np
 import cvxpy as cp
 
 from cfmm_routing.config import RoutingConfig, PoolSpec
-from cfmm_routing.market import Market
+from cfmm_routing.market import Market, curve_proxy_virtual_reserve
 
 
 _CONIC_FALLBACK_SOLVERS: Tuple[str, ...] = ("CLARABEL", "SCS", "ECOS")
@@ -43,10 +43,12 @@ def _pool_gamma(p: PoolSpec) -> float:
 
 def _pool_invariant_constraint(p: PoolSpec, R: np.ndarray, new_R: cp.Expression):
     """
-    Convex-friendly pool feasibility constraints, close to the original repo.
+    Convex-friendly pool feasibility constraints.
     - univ2: constant product via geo_mean(new_R) >= geo_mean(R)
     - bal_wgm: weighted geometric mean via geo_mean(new_R, p=w) >= geo_mean(R, p=w)
-    - curve: use constant-sum proxy (transparent; replace later with exact stable-swap if desired)
+    - curve: calibrated StableSwap proxy implemented as constant product on
+      virtual reserves new_R + v, where v is resolved from the shared Curve
+      parameters (`A` and/or `k`) so routing matches market pricing.
     """
     cons = [new_R >= 0]
 
@@ -60,9 +62,8 @@ def _pool_invariant_constraint(p: PoolSpec, R: np.ndarray, new_R: cp.Expression)
         cons.append(cp.geo_mean(new_R, p=w) >= cp.geo_mean(R, p=w))
 
     elif p.ptype == "curve":
-        # transparent proxy consistent with convex modeling:
-        # constant-sum feasibility (no free removal of total reserves)
-        cons.append(cp.sum(new_R) >= float(np.sum(R)))
+        v = curve_proxy_virtual_reserve(p)
+        cons.append(cp.geo_mean(new_R + v) >= cp.geo_mean(R + v))
 
     else:
         raise ValueError(f"Unknown pool type: {p.ptype}")

@@ -103,6 +103,24 @@ How about this claim:
 - Fromalise generative model 
     - More Curve Snapshots (?) 
     - Idea:
-      - Curve network as base (?) 
+      - Curve network as base (?)
 
-      
+
+### Curve modeling note
+
+Curve pools are currently modeled as a **calibrated StableSwap proxy**, not the exact
+Curve invariant. The primary research-facing parameter remains amplification-style
+`A`. Both `market.py` and `routing.py` can consume that `A` directly by translating it
+into the proxy depth parameter `k`, and `build_market_config_from_graph` stores both
+fields so the mapping is explicit and reusable.
+
+The translation is category-conditioned so the research model can distinguish:
+- `stable_stable`: deepest near-peg proxy, using the smallest `k` values,
+- `major_major`: intermediate depth,
+- `mixed`: shallower than stable-stable but deeper than the generic fallback.
+
+Operationally, the proxy treats Curve as a symmetric constant-product pool with
+virtual reserve offsets chosen to reproduce the concave output formula
+`dy = dx_eff * L / (L + k * dx_eff)`. That means any reported lowest-cost envelope
+should be interpreted as the envelope of this calibrated proxy family rather than as
+an exact StableSwap execution guarantee.

@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
-import math
 
 from cfmm_routing.config import MarketConfig, PoolSpec
+
+_CURVE_CATEGORY_SCALE = {
+    "stable_stable": 30.0,
+    "major_major": 140.0,
+    "mixed": 90.0,
+    "other": 180.0,
+}
 
 def _is_cvx(x) -> bool:
     try:
@@ -45,6 +51,30 @@ def build_market(cfg: MarketConfig) -> Market:
 
 def _fee(p: PoolSpec) -> float:
     return float(p.params.get("fee", 0.0))
+
+
+def curve_proxy_k(p: PoolSpec) -> float:
+    """Resolve the Curve proxy depth parameter, deriving it from A when needed."""
+    if p.params.get("k") is not None:
+        k = float(p.params["k"])
+    else:
+        category = str(p.params.get("curve_category", "other"))
+        A = float(p.params.get("A", 120.0))
+        if A <= 0:
+            raise ValueError("curve proxy requires A > 0 when k is not provided")
+        scale = float(_CURVE_CATEGORY_SCALE.get(category, _CURVE_CATEGORY_SCALE["other"]))
+        k = scale / (scale + A)
+
+    if k <= 0:
+        raise ValueError("curve proxy requires k > 0")
+    return k
+
+
+def curve_proxy_virtual_reserve(p: PoolSpec) -> float:
+    """Virtual reserve boost used by the calibrated Curve proxy."""
+    L = float(p.liquidity)
+    k = curve_proxy_k(p)
+    return L * (1.0 / k - 1.0)
 
 
 # def univ2_out_given_in(p: PoolSpec, dx):
@@ -118,33 +148,37 @@ def bal_wgm_out_given_in(p: PoolSpec, dx: float) -> float:
 
 def curve_stableswap_out_given_in(p: PoolSpec, dx) -> float:
     """
-    CVXPY-safe concave proxy for stableswap depth.
+    Calibrated StableSwap proxy used consistently in pricing and routing.
 
-    Original: dy = dx_eff * L / (L + k * dx_eff)
+    This is not the exact Curve invariant. The research input may specify Curve
+    depth via amplification-style `A`; the implementation resolves that into the
+    proxy depth parameter `k` (or consumes an explicit `k` if already present).
+    We then model the pool as a symmetric constant-product pool with equal
+    virtual reserve offsets on both assets. For liquidity L and proxy parameter
+    k in (0, 1], the virtual reserve offset is v = L * (1 / k - 1). With equal
+    starting reserves, this yields
 
-    Rewrite (k>0):
-      dy = (L/k) * (1 - L/(L + k*dx_eff))
-         = (L/k) * (1 - L * inv_pos(L + k*dx_eff))
+        dy = dx_eff * L / (L + k * dx_eff),
+
+    while remaining compatible with the convex routing formulation. Smaller k
+    means deeper near-peg liquidity.
     """
     fee = _fee(p)
     dx_eff = dx * (1.0 - fee)
 
     L = float(p.liquidity)
-    k = float(p.params.get("k", 0.2))
-    if k <= 0:
-        raise ValueError("curve proxy requires k > 0")
+    v = curve_proxy_virtual_reserve(p)
+    base = L + v
 
-    # CVXPY branch
     try:
         import cvxpy as cp
         if isinstance(dx_eff, cp.Expression):
-            return (L / k) * (1.0 - L * cp.inv_pos(L + k * dx_eff))
+            return base * (1.0 - base * cp.inv_pos(base + dx_eff))
     except Exception:
         pass
 
-    # numeric fallback (same formula; more stable than direct ratio)
     dx_eff = max(float(dx_eff), 0.0)
-    return (L / k) * (1.0 - L / (L + k * dx_eff))
+    return base * dx_eff / (base + dx_eff)
 
 
 
