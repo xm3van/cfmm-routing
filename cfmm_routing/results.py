@@ -2,8 +2,58 @@ from __future__ import annotations
 
 import csv
 import os
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Optional
+
+from cfmm_routing.config import MarketConfig
+
+
+def edge_category_key(edge_category: tuple[str, str] | None) -> str:
+    if edge_category is None:
+        return "unknown"
+    return "__".join(edge_category)
+
+
+def aggregate_pool_flow_by_edge_category(
+    pool_out: Dict[str, float],
+    market_cfg: MarketConfig,
+    mode: str = "sum",
+) -> Dict[str, float]:
+    """
+    Aggregate pool-level flow by graph-derived edge category persisted in MarketConfig.
+    """
+    mode = mode.lower().strip()
+    categories = market_cfg.edge_category_by_pool_uid()
+    grouped: Dict[str, list[float]] = defaultdict(list)
+
+    for pool_uid, value in pool_out.items():
+        v = safe_float(value)
+        if not (v > 0):
+            continue
+        grouped[edge_category_key(categories.get(pool_uid))].append(v)
+
+    out: Dict[str, float] = {}
+    for category, flows in grouped.items():
+        if mode == "sum":
+            out[category] = float(sum(flows))
+        elif mode == "mean":
+            out[category] = float(sum(flows) / len(flows))
+        elif mode == "max":
+            out[category] = float(max(flows))
+        elif mode == "min":
+            out[category] = float(min(flows))
+        else:
+            raise ValueError(f"Unknown mode={mode!r}")
+    return out
+
+
+def pool_uid_to_edge_category(market_cfg: MarketConfig) -> Dict[str, tuple[str, str]]:
+    return market_cfg.edge_category_by_pool_uid()
+
+
+def asset_id_to_token_type(market_cfg: MarketConfig) -> Dict[int, str]:
+    return market_cfg.token_type_by_asset_id()
 
 
 def _ensure_dir(path: str) -> None:
@@ -111,6 +161,7 @@ def build_flow_rows(
     aggregate_fn,
     aggregate_mode: str = "bottleneck",
     extra: Optional[Dict[str, Any]] = None,
+    key_metadata_fn: Optional[Callable[[str], Dict[str, Any]]] = None,
 ) -> list[dict]:
     """
     Optional routing detail: one row per (dx, key), where key is typically route id.
@@ -122,8 +173,10 @@ def build_flow_rows(
       - key (route/pool/etc)
       - flow
       - share (flow / total)
+      - any extra key-level metadata returned by key_metadata_fn
     """
     extra = extra or {}
+    key_metadata_fn = key_metadata_fn or (lambda _key: {})
     rows: list[dict] = []
 
     for dx, pool_out in zip(dxs, comp):
@@ -146,6 +199,7 @@ def build_flow_rows(
                     "flow": v,
                     "share": v / total,
                     "agg_mode": aggregate_mode,
+                    **key_metadata_fn(str(key)),
                 }
             )
 
