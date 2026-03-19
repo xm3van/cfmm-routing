@@ -5,7 +5,13 @@ import json
 import numpy as np
 
 
-from experiments.experiment_01_network_typology import DEFAULT_ROLE_PROBS, TOPOLOGY_PRESETS
+from experiments.experiment_01_network_typology import (
+    DEFAULT_DEGREE_CORRECTION,
+    DEFAULT_PAIR_SAMPLING_POLICY,
+    DEFAULT_PARETO_ALPHA,
+    DEFAULT_ROLE_PROBS,
+    TOPOLOGY_PRESETS,
+)
 from cfmm_routing.config import RoutingConfig
 from cfmm_routing.experiments import (
     CategoryDefinition,
@@ -125,6 +131,10 @@ def main() -> int:
     assert all(row["n_nodes"] == 28 for row in result.node_rows)
     assert all(row["n_nodes"] == 28 for row in result.edge_rows)
     assert all(preset.role_probs == DEFAULT_ROLE_PROBS for preset in TOPOLOGY_PRESETS.values())
+    assert all(preset.degree_correction == DEFAULT_DEGREE_CORRECTION for preset in TOPOLOGY_PRESETS.values())
+    assert all(preset.pareto_alpha == DEFAULT_PARETO_ALPHA for preset in TOPOLOGY_PRESETS.values())
+    assert DEFAULT_PAIR_SAMPLING_POLICY.mode == "all"
+    assert DEFAULT_PAIR_SAMPLING_POLICY.max_pairs_per_category is None
 
 
     print(json.dumps({

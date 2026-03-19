@@ -32,6 +32,9 @@ class TopologyPreset:
 
 
 DEFAULT_ROLE_PROBS: dict[str, float] = {"core": 0.08, "mid": 0.17, "periphery": 0.75}
+DEFAULT_DEGREE_CORRECTION = True
+DEFAULT_PARETO_ALPHA = 2.5
+DEFAULT_PAIR_SAMPLING_POLICY = PairSamplingPolicy(mode="all")
 
 
 TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
@@ -45,8 +48,8 @@ TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
             ("mid", "periphery"): 0.03,
             ("periphery", "periphery"): 0.008,
         },
-        degree_correction=True,
-        pareto_alpha=2.1,
+        degree_correction=DEFAULT_DEGREE_CORRECTION,
+        pareto_alpha=DEFAULT_PARETO_ALPHA,
     ),
     "balanced": TopologyPreset(
         role_probs=DEFAULT_ROLE_PROBS,
@@ -58,8 +61,8 @@ TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
             ("mid", "periphery"): 0.12,
             ("periphery", "periphery"): 0.08,
         },
-        degree_correction=True,
-        pareto_alpha=2.8,
+        degree_correction=DEFAULT_DEGREE_CORRECTION,
+        pareto_alpha=DEFAULT_PARETO_ALPHA,
     ),
     "fragmented_periphery": TopologyPreset(
         role_probs=DEFAULT_ROLE_PROBS,
@@ -71,8 +74,8 @@ TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
             ("mid", "periphery"): 0.025,
             ("periphery", "periphery"): 0.002,
         },
-        degree_correction=False,
-        pareto_alpha=3.5,
+        degree_correction=DEFAULT_DEGREE_CORRECTION,
+        pareto_alpha=DEFAULT_PARETO_ALPHA,
     ),
     "hub_dominant": TopologyPreset(
         role_probs=DEFAULT_ROLE_PROBS,
@@ -84,8 +87,8 @@ TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
             ("mid", "periphery"): 0.035,
             ("periphery", "periphery"): 0.004,
         },
-        degree_correction=True,
-        pareto_alpha=1.8,
+        degree_correction=DEFAULT_DEGREE_CORRECTION,
+        pareto_alpha=DEFAULT_PARETO_ALPHA,
     ),
 }
 
@@ -170,7 +173,7 @@ def build_experiment_config(topology_preset: str) -> ExperimentConfig:
             "role_probs": dict(preset.role_probs),
         },
         seeds=(3, 4, 5),
-        pair_sampling_policy=PairSamplingPolicy(mode="sample", max_pairs_per_category=5, seed_offset=91),
+        pair_sampling_policy=DEFAULT_PAIR_SAMPLING_POLICY,
         trade_size_grid=(1.0, 10.0, 100.0),
         category_definitions=(
             CategoryDefinition(name="stable->stable", source_token_types=("stable",), target_token_types=("stable",)),
