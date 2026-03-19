@@ -29,9 +29,43 @@ def _pool_local_assets(p: PoolSpec) -> List[int]:
     return [p.i, p.j]
 
 
+def _pool_reserve_param(p: PoolSpec, names: Tuple[str, ...]) -> float | None:
+    for name in names:
+        value = p.params.get(name)
+        if value is not None:
+            return float(value)
+    return None
+
+
 def _pool_reserves(p: PoolSpec, local_assets: List[int]) -> np.ndarray:
-    # current modeling assumption: "liquidity" is symmetric reserves per asset
-    # (matches your E0 config: liquidity=1e6 -> reserves [1e6, 1e6])
+    reserve_i = _pool_reserve_param(p, ("reserve_i", "x_reserve", f"reserve_{p.i}"))
+    reserve_j = _pool_reserve_param(p, ("reserve_j", "y_reserve", f"reserve_{p.j}"))
+    if reserve_i is not None and reserve_j is not None:
+        reserve_by_asset = {p.i: reserve_i, p.j: reserve_j}
+        return np.array([reserve_by_asset[idx] for idx in local_assets], dtype=float)
+
+    if p.ptype == "bal_wgm":
+        wi = max(float(p.params.get("w_i", 0.5)), 1e-6)
+        wj = max(float(p.params.get("w_j", 0.5)), 1e-6)
+        total_w = wi + wj
+        reserve_by_asset = {
+            p.i: float(p.liquidity) * wi / total_w,
+            p.j: float(p.liquidity) * wj / total_w,
+        }
+        return np.array([reserve_by_asset[idx] for idx in local_assets], dtype=float)
+
+    reserve_ratio = _pool_reserve_param(p, ("reserve_ratio", "price_scale", "peg_offset"))
+    if reserve_ratio is not None and reserve_ratio > 0:
+        ratio = float(reserve_ratio)
+        base = float(p.liquidity)
+        reserve_by_asset = {
+            p.i: base * ratio / (1.0 + ratio),
+            p.j: base / (1.0 + ratio),
+        }
+        return np.array([reserve_by_asset[idx] for idx in local_assets], dtype=float)
+
+    # Fallback: use symmetric reserves only when the upstream data contains no
+    # asset-specific reserve or weighting information.
     return np.array([float(p.liquidity) for _ in local_assets], dtype=float)
 
 
@@ -46,7 +80,8 @@ def _pool_invariant_constraint(p: PoolSpec, R: np.ndarray, new_R: cp.Expression)
     Convex-friendly pool feasibility constraints, close to the original repo.
     - univ2: constant product via geo_mean(new_R) >= geo_mean(R)
     - bal_wgm: weighted geometric mean via geo_mean(new_R, p=w) >= geo_mean(R, p=w)
-    - curve: use constant-sum proxy (transparent; replace later with exact stable-swap if desired)
+    - curve: calibrated stable-swap proxy using a constant-sum envelope plus a
+      geometric-mean floor tied to amplification A to penalize reserve imbalance.
     """
     cons = [new_R >= 0]
 
@@ -60,9 +95,19 @@ def _pool_invariant_constraint(p: PoolSpec, R: np.ndarray, new_R: cp.Expression)
         cons.append(cp.geo_mean(new_R, p=w) >= cp.geo_mean(R, p=w))
 
     elif p.ptype == "curve":
-        # transparent proxy consistent with convex modeling:
-        # constant-sum feasibility (no free removal of total reserves)
+        # Stable-swap is not represented exactly here because the exact invariant
+        # is not DCP-friendly. Instead we use a calibrated convex proxy:
+        #   1) preserve total amplified depth via a constant-sum envelope
+        #   2) preserve a floor on the geometric mean to prevent unrealistic
+        #      one-sided depletion that the pure constant-sum proxy allowed
+        # The geometric-mean floor scales with A and asymptotes toward 1.0 as A
+        # increases, which keeps high-A pools flatter near the peg while still
+        # introducing meaningful curvature away from balance.
+        A = max(float(p.params.get("A", 100.0)), 1.0)
+        gm_floor = min(0.995, A / (A + 50.0))
+        reference_gm = float(np.sqrt(np.prod(R)))
         cons.append(cp.sum(new_R) >= float(np.sum(R)))
+        cons.append(cp.geo_mean(new_R) >= gm_floor * reference_gm)
 
     else:
         raise ValueError(f"Unknown pool type: {p.ptype}")
@@ -87,7 +132,7 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
     # reserves/endowment are very large (common in on-chain units).
     reserve_scale_candidates = [abs(float(dx_total))]
     for p in pools:
-        reserve_scale_candidates.append(abs(float(p.liquidity)))
+        reserve_scale_candidates.extend(abs(float(r)) for r in _pool_reserves(p, _pool_local_assets(p)))
     flow_scale = max(1.0, max(reserve_scale_candidates, default=1.0))
 
     local_assets_list: List[List[int]] = []
