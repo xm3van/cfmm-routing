@@ -31,9 +31,12 @@ class TopologyPreset:
     pareto_alpha: float
 
 
+DEFAULT_ROLE_PROBS: dict[str, float] = {"core": 0.08, "mid": 0.17, "periphery": 0.75}
+
+
 TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
     "core_periphery_strong": TopologyPreset(
-        role_probs={"core": 0.08, "mid": 0.17, "periphery": 0.75},
+        role_probs=DEFAULT_ROLE_PROBS,
         role_connectivity={
             ("core", "core"): 0.65,
             ("core", "mid"): 0.34,
@@ -46,7 +49,7 @@ TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
         pareto_alpha=2.1,
     ),
     "balanced": TopologyPreset(
-        role_probs={"core": 0.22, "mid": 0.38, "periphery": 0.40},
+        role_probs=DEFAULT_ROLE_PROBS,
         role_connectivity={
             ("core", "core"): 0.34,
             ("core", "mid"): 0.24,
@@ -59,7 +62,7 @@ TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
         pareto_alpha=2.8,
     ),
     "fragmented_periphery": TopologyPreset(
-        role_probs={"core": 0.10, "mid": 0.20, "periphery": 0.70},
+        role_probs=DEFAULT_ROLE_PROBS,
         role_connectivity={
             ("core", "core"): 0.48,
             ("core", "mid"): 0.22,
@@ -72,7 +75,7 @@ TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
         pareto_alpha=3.5,
     ),
     "hub_dominant": TopologyPreset(
-        role_probs={"core": 0.05, "mid": 0.15, "periphery": 0.80},
+        role_probs=DEFAULT_ROLE_PROBS,
         role_connectivity={
             ("core", "core"): 0.72,
             ("core", "mid"): 0.44,
@@ -164,6 +167,7 @@ def build_experiment_config(topology_preset: str) -> ExperimentConfig:
             "topology_preset": topology_preset,
             "degree_correction": preset.degree_correction,
             "pareto_alpha": preset.pareto_alpha,
+            "role_probs": dict(preset.role_probs),
         },
         seeds=(3, 4, 5),
         pair_sampling_policy=PairSamplingPolicy(mode="sample", max_pairs_per_category=5, seed_offset=91),
