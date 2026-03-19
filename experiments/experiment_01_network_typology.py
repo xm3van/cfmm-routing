@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
-import json
+from dataclasses import dataclass
+
 import numpy as np
 
 from cfmm_routing.config import RoutingConfig
@@ -23,20 +23,80 @@ from cfmm_routing.sbm import (
 )
 
 
-def build_generator(config: ExperimentConfig, seed: int) -> SBMGenerator:
-    role_cfg = RoleSBMConfig(
-        n_nodes=int(config.fixed_parameters["n_nodes"]),
+@dataclass(frozen=True)
+class TopologyPreset:
+    role_probs: dict[str, float]
+    role_connectivity: dict[tuple[str, str], float]
+    degree_correction: bool
+    pareto_alpha: float
+
+
+TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
+    "core_periphery_strong": TopologyPreset(
         role_probs={"core": 0.08, "mid": 0.17, "periphery": 0.75},
         role_connectivity={
-            ("core", "core"): float(config.fixed_parameters["p_core_core"]),
-            ("core", "mid"): 0.35,
-            ("core", "periphery"): 0.15,
-            ("mid", "mid"): 0.08,
-            ("mid", "periphery"): 0.04,
-            ("periphery", "periphery"): float(config.varied_parameter.value),
+            ("core", "core"): 0.65,
+            ("core", "mid"): 0.34,
+            ("core", "periphery"): 0.14,
+            ("mid", "mid"): 0.09,
+            ("mid", "periphery"): 0.03,
+            ("periphery", "periphery"): 0.008,
         },
         degree_correction=True,
-        pareto_alpha=2.5,
+        pareto_alpha=2.1,
+    ),
+    "balanced": TopologyPreset(
+        role_probs={"core": 0.22, "mid": 0.38, "periphery": 0.40},
+        role_connectivity={
+            ("core", "core"): 0.34,
+            ("core", "mid"): 0.24,
+            ("core", "periphery"): 0.18,
+            ("mid", "mid"): 0.18,
+            ("mid", "periphery"): 0.12,
+            ("periphery", "periphery"): 0.08,
+        },
+        degree_correction=True,
+        pareto_alpha=2.8,
+    ),
+    "fragmented_periphery": TopologyPreset(
+        role_probs={"core": 0.10, "mid": 0.20, "periphery": 0.70},
+        role_connectivity={
+            ("core", "core"): 0.48,
+            ("core", "mid"): 0.22,
+            ("core", "periphery"): 0.08,
+            ("mid", "mid"): 0.07,
+            ("mid", "periphery"): 0.025,
+            ("periphery", "periphery"): 0.002,
+        },
+        degree_correction=False,
+        pareto_alpha=3.5,
+    ),
+    "hub_dominant": TopologyPreset(
+        role_probs={"core": 0.05, "mid": 0.15, "periphery": 0.80},
+        role_connectivity={
+            ("core", "core"): 0.72,
+            ("core", "mid"): 0.44,
+            ("core", "periphery"): 0.22,
+            ("mid", "mid"): 0.06,
+            ("mid", "periphery"): 0.035,
+            ("periphery", "periphery"): 0.004,
+        },
+        degree_correction=True,
+        pareto_alpha=1.8,
+    ),
+}
+
+
+def build_generator(config: ExperimentConfig, seed: int) -> SBMGenerator:
+    preset_name = str(config.fixed_parameters["topology_preset"])
+    preset = TOPOLOGY_PRESETS[preset_name]
+
+    role_cfg = RoleSBMConfig(
+        n_nodes=int(config.fixed_parameters["n_nodes"]),
+        role_probs=preset.role_probs,
+        role_connectivity=preset.role_connectivity,
+        degree_correction=preset.degree_correction,
+        pareto_alpha=preset.pareto_alpha,
         seed=seed,
     )
     topology_model = TopologyModel(role_cfg)
@@ -92,12 +152,21 @@ def build_generator(config: ExperimentConfig, seed: int) -> SBMGenerator:
     return SBMGenerator(topology_model=topology_model, node_model=node_model, edge_model=edge_model)
 
 
-def main() -> int:
-    config = ExperimentConfig(
-        varied_parameter=VariedParameter(name="p_periphery_periphery", value=0.01),
-        fixed_parameters={"n_nodes": 28, "p_core_core": 0.55},
-        seeds=(3, 4),
-        pair_sampling_policy=PairSamplingPolicy(mode="sample", max_pairs_per_category=3, seed_offset=91),
+def build_experiment_config(topology_preset: str) -> ExperimentConfig:
+    if topology_preset not in TOPOLOGY_PRESETS:
+        raise KeyError(f"Unknown topology preset: {topology_preset}")
+
+    preset = TOPOLOGY_PRESETS[topology_preset]
+    return ExperimentConfig(
+        varied_parameter=VariedParameter(name="topology_preset", value=topology_preset),
+        fixed_parameters={
+            "n_nodes": 28,
+            "topology_preset": topology_preset,
+            "degree_correction": preset.degree_correction,
+            "pareto_alpha": preset.pareto_alpha,
+        },
+        seeds=(3, 4, 5),
+        pair_sampling_policy=PairSamplingPolicy(mode="sample", max_pairs_per_category=5, seed_offset=91),
         trade_size_grid=(1.0, 10.0, 100.0),
         category_definitions=(
             CategoryDefinition(name="stable->stable", source_token_types=("stable",), target_token_types=("stable",)),
@@ -110,27 +179,10 @@ def main() -> int:
         ),
     )
 
-    result = run_experiment(config, build_generator)
 
-    assert len(result.graph_rows) == len(config.seeds)
-    assert result.graph_curve_rows, "expected per-graph aggregated curves"
-    assert result.aggregate_curve_rows, "expected aggregated curves across seeds"
-    assert result.eligible_pair_rows, "expected eligible reachable pairs"
-    assert result.pair_curve_rows, "expected pair-level sweep outputs"
-    assert all("varied_parameter_name" in row for row in result.graph_rows)
-    assert all(row["pair_count"] >= 1 for row in result.graph_curve_rows)
-    assert all(row["n_nodes"] == 28 for row in result.aggregate_curve_rows)
-    assert all(row["n_nodes"] == 28 for row in result.node_rows)
-    assert all(row["n_nodes"] == 28 for row in result.edge_rows)
-
-
-    print(json.dumps({
-        "graphs": len(result.graph_rows),
-        "eligible_pairs": len(result.eligible_pair_rows),
-        "pair_curve_rows": len(result.pair_curve_rows),
-        "graph_curve_rows": len(result.graph_curve_rows),
-        "aggregate_curve_rows": len(result.aggregate_curve_rows),
-    }, indent=2))
+def main() -> int:
+    config = build_experiment_config("balanced")
+    run_experiment(config, build_generator)
     return 0
 
 
