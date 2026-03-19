@@ -109,17 +109,27 @@ def graph_metadata_rows(graph: nx.Graph, seed: int) -> Dict[str, Any]:
     return metadata
 
 
-def node_rows(graph: nx.Graph, seed: int) -> list[dict[str, Any]]:
+def node_rows(
+    graph: nx.Graph,
+    seed: int,
+    metadata: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    row_metadata = dict(metadata or {})
     for node, attrs in graph.nodes(data=True):
-        rows.append({"seed": seed, "node": int(node), **dict(attrs)})
+        rows.append({"seed": seed, "node": int(node), **row_metadata, **dict(attrs)})
     return rows
 
 
-def edge_rows(graph: nx.Graph, seed: int) -> list[dict[str, Any]]:
+def edge_rows(
+    graph: nx.Graph,
+    seed: int,
+    metadata: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    row_metadata = dict(metadata or {})
     for source, target, attrs in graph.edges(data=True):
-        row = {"seed": seed, "source": int(source), "target": int(target)}
+        row = {"seed": seed, "source": int(source), "target": int(target), **row_metadata}
         row.update(dict(attrs))
         rows.append(row)
     return rows
@@ -326,12 +336,25 @@ def aggregate_curves_across_graphs(graph_curve_rows: Sequence[Mapping[str, Any]]
     buckets: dict[tuple[str, float], list[float]] = defaultdict(list)
     pair_counts: dict[tuple[str, float], list[int]] = defaultdict(list)
     seeds: dict[tuple[str, float], set[int]] = defaultdict(set)
+    metadata_by_key: dict[tuple[str, float], dict[str, Any]] = {}
+    excluded_fields = {
+        "seed",
+        "category",
+        "dx",
+        "pair_count",
+        "dy_mean",
+        "dy_std",
+        "dy_min",
+        "dy_max",
+        "avg_price_mean",
+    }
 
     for row in graph_curve_rows:
         key = (str(row["category"]), float(row["dx"]))
         buckets[key].append(float(row["dy_mean"]))
         pair_counts[key].append(int(row.get("pair_count", 0)))
         seeds[key].add(int(row["seed"]))
+        metadata_by_key.setdefault(key, {k: v for k, v in row.items() if k not in excluded_fields})
 
     aggregated_rows: list[dict[str, Any]] = []
     for (category_name, dx), values in sorted(buckets.items()):
@@ -345,6 +368,7 @@ def aggregate_curves_across_graphs(graph_curve_rows: Sequence[Mapping[str, Any]]
                 "dy_mean_across_graphs": float(values_array.mean()),
                 "dy_std_across_graphs": float(values_array.std(ddof=0)),
                 "pair_count_mean": float(pairs_array.mean()) if len(pairs_array) else 0.0,
+                **metadata_by_key[(category_name, dx)],
             }
         )
     return aggregated_rows
@@ -377,22 +401,21 @@ def run_experiment(config: ExperimentConfig, generator_factory: GeneratorFactory
         artifacts = generate_graph_artifacts(generator, seed)
         graph = artifacts.graph
 
-        graph_metadata = {
+        experiment_metadata = {
             "varied_parameter_name": config.varied_parameter.name,
             "varied_parameter_value": config.varied_parameter.value,
             **dict(config.fixed_parameters),
+        }
+        graph_metadata = {
+            **experiment_metadata,
             **artifacts.metadata,
         }
         graph_rows.append(graph_metadata)
-        node_metadata_rows.extend(node_rows(graph, seed))
-        edge_metadata_rows.extend(edge_rows(graph, seed))
+        node_metadata_rows.extend(node_rows(graph, seed, metadata=experiment_metadata))
+        edge_metadata_rows.extend(edge_rows(graph, seed, metadata=experiment_metadata))
 
         category_pairs = enumerate_pairs_by_category(graph, config.category_definitions)
-        pair_metadata = {
-            "varied_parameter_name": config.varied_parameter.name,
-            "varied_parameter_value": config.varied_parameter.value,
-            **dict(config.fixed_parameters),
-        }
+        pair_metadata = dict(experiment_metadata)
         pair_selection_rows.extend(
             eligible_pair_rows(category_pairs, seed=seed, metadata=pair_metadata)
         )

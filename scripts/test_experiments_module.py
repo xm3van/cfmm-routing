@@ -4,6 +4,18 @@ from __future__ import annotations
 import json
 import numpy as np
 
+
+from experiments.experiment_01_network_typology import (
+    DEFAULT_DEGREE_CORRECTION,
+    DEFAULT_PAIR_SAMPLING_POLICY,
+    DEFAULT_PARETO_ALPHA,
+    DEFAULT_ROLE_PROBS,
+    MANIFEST_FILENAME,
+    RAW_OUTPUT_FILENAME,
+    TOKEN_TYPES,
+    TOPOLOGY_PRESETS,
+    build_exchange_route_categories,
+)
 from cfmm_routing.config import RoutingConfig
 from cfmm_routing.experiments import (
     CategoryDefinition,
@@ -119,6 +131,20 @@ def main() -> int:
     assert result.pair_curve_rows, "expected pair-level sweep outputs"
     assert all("varied_parameter_name" in row for row in result.graph_rows)
     assert all(row["pair_count"] >= 1 for row in result.graph_curve_rows)
+    assert all(row["n_nodes"] == 28 for row in result.aggregate_curve_rows)
+    assert all(row["n_nodes"] == 28 for row in result.node_rows)
+    assert all(row["n_nodes"] == 28 for row in result.edge_rows)
+    assert all(preset.role_probs == DEFAULT_ROLE_PROBS for preset in TOPOLOGY_PRESETS.values())
+    assert all(preset.degree_correction == DEFAULT_DEGREE_CORRECTION for preset in TOPOLOGY_PRESETS.values())
+    assert all(preset.pareto_alpha == DEFAULT_PARETO_ALPHA for preset in TOPOLOGY_PRESETS.values())
+    assert DEFAULT_PAIR_SAMPLING_POLICY.mode == "all"
+    assert DEFAULT_PAIR_SAMPLING_POLICY.max_pairs_per_category is None
+    assert len(build_exchange_route_categories()) == 10
+    assert build_exchange_route_categories()[0].name == f"{TOKEN_TYPES[0]}<->{TOKEN_TYPES[0]}"
+    assert build_exchange_route_categories()[-1].name == f"{TOKEN_TYPES[-1]}<->{TOKEN_TYPES[-1]}"
+    assert RAW_OUTPUT_FILENAME.endswith(".json.gz")
+    assert MANIFEST_FILENAME.endswith(".json")
+
 
     print(json.dumps({
         "graphs": len(result.graph_rows),
