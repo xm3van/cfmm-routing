@@ -231,7 +231,13 @@ class EdgeAttributeModel:
         return G
     
 
-from cfmm_routing.config import MarketConfig, PoolSpec
+from cfmm_routing.config import (
+    MarketConfig,
+    MarketMetadata,
+    PoolMetadata,
+    PoolSpec,
+    normalize_edge_category,
+)
 
 # def build_market_config_from_sbm(
 #     sbm_generator: SBMGenerator,
@@ -303,9 +309,19 @@ def build_market_config_from_graph(
         - 'liquidity'
         - optionally 'fee'
         - optionally AMM-specific params
+
+    Graph-derived metadata is persisted on the returned MarketConfig so
+    downstream stages can recover token/category labels without the
+    original graph object.
     """
 
     pools = []
+    asset_token_types = {
+        int(node): str(data["token_type"])
+        for node, data in G.nodes(data=True)
+        if "token_type" in data
+    }
+    pool_metadata = {}
 
     for idx, (i, j, data) in enumerate(G.edges(data=True)):
 
@@ -334,6 +350,17 @@ def build_market_config_from_graph(
             params["w_j"] = float(data["w_j"])
 
         uid = f"{ptype}-{idx}:{i}-{j}"
+        i_data = G.nodes[i]
+        j_data = G.nodes[j]
+
+        token_type_i = i_data.get("token_type")
+        token_type_j = j_data.get("token_type")
+        edge_category = None
+        if token_type_i is not None and token_type_j is not None:
+            edge_category = normalize_edge_category(
+                str(token_type_i),
+                str(token_type_j),
+            )
 
         pools.append(
             PoolSpec(
@@ -345,8 +372,19 @@ def build_market_config_from_graph(
                 params=params,
             )
         )
+        pool_metadata[uid] = PoolMetadata(
+            token_type_i=None if token_type_i is None else str(token_type_i),
+            token_type_j=None if token_type_j is None else str(token_type_j),
+            role_i=None if i_data.get("role") is None else str(i_data.get("role")),
+            role_j=None if j_data.get("role") is None else str(j_data.get("role")),
+            edge_category=edge_category,
+        )
 
     return MarketConfig(
         n_assets=G.number_of_nodes(),
         pools=tuple(pools),
+        metadata=MarketMetadata(
+            asset_token_types=asset_token_types,
+            pool_metadata=pool_metadata,
+        ),
     )
