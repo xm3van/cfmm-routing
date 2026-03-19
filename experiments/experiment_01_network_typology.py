@@ -283,6 +283,10 @@ def _append_metric_rows(
                     "price_deterioration": _relative_price_deterioration(avg_price, baseline_avg_price),
                     "routing_cost_diagnostic": _routing_cost(dx, dy),
                     "log_cost": _log_cost(avg_price),
+                    "marginal_avg_price": float("nan"),
+                    "marginal_price_impact": float("nan"),
+                    "marginal_log_cost": float("nan"),
+                    "marginal_cost": float("nan"),
                 }
             )
 
@@ -316,6 +320,8 @@ def _append_metric_rows(
                     "dx_right": dx_curr,
                     "marginal_avg_price": marginal_avg_price,
                     "marginal_price_impact": marginal_price_impact,
+                    "marginal_log_cost": _log_cost(marginal_avg_price),
+                    "marginal_cost": _routing_cost(1.0, marginal_avg_price),
                 }
             )
 
@@ -357,6 +363,7 @@ def collect_typology_outputs(
 ) -> dict[str, object]:
     pair_metrics_rows: list[dict[str, float | int | str]] = []
     category_metrics_rows: list[dict[str, float | int | str]] = []
+    lowest_marginal_cost_rows: list[dict[str, float | int | str]] = []
     routing_behavior_rows: list[dict[str, float | int | str]] = []
     raw_results_by_preset: dict[str, dict[str, object]] = {}
 
@@ -481,9 +488,36 @@ def collect_typology_outputs(
                                 }
                             )
 
+    lowest_marginal_cost_by_key: dict[tuple[str, int, str, float], float] = {}
+    for row in pair_metrics_rows:
+        if row.get("metric_kind") != "marginal":
+            continue
+        key = (
+            str(row["topology_preset"]),
+            int(row["seed"]),
+            str(row["category"]),
+            float(row["dx"]),
+        )
+        lowest_marginal_cost_by_key[key] = min(
+            lowest_marginal_cost_by_key.get(key, float("inf")),
+            float(row["marginal_cost"]),
+        )
+
+    for (topology_preset, seed, category, dx), marginal_cost in sorted(lowest_marginal_cost_by_key.items()):
+        lowest_marginal_cost_rows.append(
+            {
+                "topology_preset": topology_preset,
+                "seed": seed,
+                "category": category,
+                "dx": dx,
+                "lowest_marginal_cost": marginal_cost,
+            }
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     write_csv(str(output_dir / "pair_metrics_rows.csv"), pair_metrics_rows)
     write_csv(str(output_dir / "category_metrics_rows.csv"), category_metrics_rows)
+    write_csv(str(output_dir / "lowest_marginal_cost_rows.csv"), lowest_marginal_cost_rows)
     write_csv(str(output_dir / "routing_behavior_rows.csv"), routing_behavior_rows)
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -491,6 +525,7 @@ def collect_typology_outputs(
         "raw_results_by_preset": raw_results_by_preset,
         "pair_metrics_rows": pair_metrics_rows,
         "category_metrics_rows": category_metrics_rows,
+        "lowest_marginal_cost_rows": lowest_marginal_cost_rows,
         "routing_behavior_rows": routing_behavior_rows,
     }
 
@@ -499,6 +534,130 @@ def plot_category_metric_summary(category_metrics_rows: list[dict[str, float | i
     import matplotlib.pyplot as plt
 
     level_rows = [row for row in category_metrics_rows if row.get("metric_kind", "level") == "level"]
+    marginal_rows = [row for row in category_metrics_rows if row.get("metric_kind") == "marginal"]
+
+    level_metrics = {
+        "avg_price": ("Average price (dy / dx)", None),
+        "normalized_avg_price": ("Normalized avg price vs smallest trade", None),
+        "routing_cost_diagnostic": ("Routing cost diagnostic (dx / dy)", None),
+    }
+
+    categories = sorted({str(row["category"]) for row in category_metrics_rows})
+    fig, axes = plt.subplots(
+        nrows=len(categories),
+        ncols=4,
+        figsize=(20, max(4, 3.8 * len(categories))),
+        sharex=False,
+    )
+    axes = np.atleast_2d(axes)
+
+    for row_axes, category in zip(axes, categories):
+        category_level_rows = [row for row in level_rows if str(row["category"]) == category]
+
+        for ax, (metric_name, (ylabel, ylim)) in zip(row_axes, level_metrics.items()):
+            preset_map: dict[str, dict[float, list[float]]] = {}
+            for row in category_level_rows:
+                preset = str(row["topology_preset"])
+                dx = float(row["dx"])
+                value = float(row[metric_name])
+                preset_map.setdefault(preset, {}).setdefault(dx, []).append(value)
+            for preset, dx_map in sorted(preset_map.items()):
+                xs = sorted(dx_map)
+                ys = [float(np.mean(dx_map[dx])) for dx in xs]
+                ax.plot(xs, ys, marker="o", linewidth=2, label=preset)
+            ax.set_title(f"{category}\n{ylabel}")
+            ax.set_xlabel("Trade size (dx)")
+            ax.set_ylabel(ylabel)
+            if ylim is not None:
+                ax.set_ylim(*ylim)
+            ax.set_xscale("log")
+            ax.grid(True, alpha=0.3)
+
+        marginal_ax = row_axes[-1]
+        marginal_preset_map: dict[str, dict[float, list[float]]] = {}
+        for row in marginal_rows:
+            if str(row["category"]) != category:
+                continue
+            preset = str(row["topology_preset"])
+            dx = float(row["dx"])
+            marginal_preset_map.setdefault(preset, {}).setdefault(dx, []).append(float(row["marginal_avg_price"]))
+        for preset, dx_map in sorted(marginal_preset_map.items()):
+            xs = sorted(dx_map)
+            ys = [float(np.mean(dx_map[dx])) for dx in xs]
+            marginal_ax.plot(xs, ys, marker="o", linewidth=2, label=preset)
+        marginal_ax.set_title(f"{category}\nMarginal price (Δdy / Δdx)")
+        marginal_ax.set_xlabel("Trade size midpoint")
+        marginal_ax.set_ylabel("Marginal price")
+        marginal_ax.set_xscale("log")
+        marginal_ax.grid(True, alpha=0.3)
+
+    for ax in axes.flat:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(frameon=False, fontsize=8)
+            break
+    fig.tight_layout()
+    out_path = output_dir / "category_metric_summary.png"
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_marginal_price_impact_summary(
+    category_metrics_rows: list[dict[str, float | int | str]],
+    output_dir: Path,
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    marginal_rows = [row for row in category_metrics_rows if row.get("metric_kind") == "marginal"]
+    categories = sorted({str(row["category"]) for row in marginal_rows})
+    ncols = 2
+    nrows = max(1, int(np.ceil(len(categories) / ncols)))
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(14, max(4, 3.8 * nrows)), sharex=False)
+    axes = np.atleast_1d(axes).reshape(nrows, ncols)
+
+    for ax, category in zip(axes.flatten(), categories):
+        preset_map: dict[str, dict[float, list[float]]] = {}
+        for row in marginal_rows:
+            if str(row["category"]) != category:
+                continue
+            preset = str(row["topology_preset"])
+            dx = float(row["dx"])
+            preset_map.setdefault(preset, {}).setdefault(dx, []).append(float(row["marginal_avg_price"]))
+        for preset, dx_map in sorted(preset_map.items()):
+            xs = sorted(dx_map)
+            ys = [float(np.mean(dx_map[dx])) for dx in xs]
+            ax.plot(xs, ys, marker="o", linewidth=2, label=preset)
+        ax.set_title(f"Mean marginal price: {category}")
+        ax.set_xlabel("Trade size midpoint")
+        ax.set_ylabel("Marginal price (Δdy / Δdx)")
+        ax.set_xscale("log")
+        ax.grid(True, alpha=0.3)
+
+    for ax in axes.flatten()[len(categories):]:
+        ax.axis("off")
+    if categories:
+        axes[0, 0].legend(frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    fig.tight_layout()
+    out_path = output_dir / "marginal_price_summary.png"
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_lowest_marginal_cost_grid(
+    lowest_marginal_cost_rows: list[dict[str, float | int | str]],
+    output_dir: Path,
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    by_category: dict[str, dict[str, dict[float, list[float]]]] = {}
+    for row in lowest_marginal_cost_rows:
+        category = str(row["category"])
+        preset = str(row["topology_preset"])
+        dx = float(row["dx"])
+        value = float(row["lowest_marginal_cost"])
+        by_category.setdefault(category, {}).setdefault(preset, {}).setdefault(dx, []).append(value)
 
     level_metrics = {
         "avg_price": ("Average price (dy / dx)", None),
@@ -559,33 +718,31 @@ def plot_marginal_price_impact_summary(
     categories = sorted({str(row["category"]) for row in marginal_rows})
     ncols = 2
     nrows = max(1, int(np.ceil(len(categories) / ncols)))
-    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(14, max(4, 3.8 * nrows)), sharex=False)
-    axes = np.atleast_1d(axes).reshape(nrows, ncols)
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(14, max(4, 3.8 * nrows)), sharex=False, squeeze=False)
 
     for ax, category in zip(axes.flatten(), categories):
-        preset_map: dict[str, dict[float, list[float]]] = {}
-        for row in marginal_rows:
-            if str(row["category"]) != category:
+        preset_map = by_category[category]
+        for preset in sorted(TOPOLOGY_PRESETS):
+            dx_map = preset_map.get(preset, {})
+            if not dx_map:
                 continue
-            preset = str(row["topology_preset"])
-            dx = float(row["dx"])
-            preset_map.setdefault(preset, {}).setdefault(dx, []).append(float(row["marginal_price_impact"]))
-        for preset, dx_map in sorted(preset_map.items()):
             xs = sorted(dx_map)
-            ys = [float(np.mean(dx_map[dx])) for dx in xs]
-            ax.plot(xs, ys, marker="o", linewidth=2, label=preset)
-        ax.set_title(f"Mean marginal price impact: {category}")
+            mean_curve = np.array([float(np.mean(dx_map[dx])) for dx in xs], dtype=float)
+            std_curve = np.array([float(np.std(dx_map[dx], ddof=0)) for dx in xs], dtype=float)
+            ax.plot(xs, mean_curve, marker="o", linewidth=2, label=preset)
+            ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, alpha=0.15)
+        ax.set_title(f"Lowest marginal cost: {category}")
         ax.set_xlabel("Trade size midpoint")
-        ax.set_ylabel("Marginal price impact")
-        ax.set_ylim(0.0, 1.0)
-        ax.grid(True, alpha=0.3)
+        ax.set_ylabel("Lowest marginal cost (1 / (Δdy / Δdx))")
+        ax.set_xscale("log")
+        ax.grid(True, alpha=0.25)
 
     for ax in axes.flatten()[len(categories):]:
         ax.axis("off")
     if categories:
         axes[0, 0].legend(frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.0))
     fig.tight_layout()
-    out_path = output_dir / "marginal_price_impact_summary.png"
+    out_path = output_dir / "lowest_marginal_cost_summary.png"
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return out_path
@@ -611,7 +768,7 @@ def plot_pair_liquidity_contraction_distribution(
                 continue
             preset = str(row["topology_preset"])
             dx = float(row["dx"])
-            preset_dx_map.setdefault(preset, {}).setdefault(dx, []).append(float(row["normalized_avg_price"]))
+            preset_dx_map.setdefault(preset, {}).setdefault(dx, []).append(float(row["price_deterioration"]))
 
         for preset, dx_map in sorted(preset_dx_map.items()):
             xs = sorted(dx_map)
@@ -623,7 +780,9 @@ def plot_pair_liquidity_contraction_distribution(
 
         ax.set_title(f"Liquidity contraction distribution: {category}")
         ax.set_xlabel("Trade size (dx)")
-        ax.set_ylabel("Normalized avg price vs smallest trade")
+        ax.set_ylabel("Price deterioration vs smallest trade")
+        ax.set_ylim(0.0, 1.0)
+        ax.set_xscale("log")
         ax.grid(True, alpha=0.3)
 
     for ax in axes.flatten()[len(categories):]:
@@ -632,6 +791,52 @@ def plot_pair_liquidity_contraction_distribution(
         axes[0, 0].legend(frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.0))
     fig.tight_layout()
     out_path = output_dir / "pair_liquidity_contraction_distribution.png"
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_role_block_average_network_heatmap(output_dir: Path) -> Path:
+    import matplotlib.pyplot as plt
+
+    roles = ("core", "mid", "periphery")
+    presets = sorted(TOPOLOGY_PRESETS)
+    ncols = 2
+    nrows = max(1, int(np.ceil(len(presets) / ncols)))
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10, max(4, 4.2 * nrows)), squeeze=False)
+
+    for ax, preset_name in zip(axes.flatten(), presets):
+        preset = TOPOLOGY_PRESETS[preset_name]
+        matrix = np.array(
+            [
+                [
+                    float(
+                        preset.role_connectivity.get((role_i, role_j), preset.role_connectivity.get((role_j, role_i), 0.0))
+                    )
+                    for role_j in roles
+                ]
+                for role_i in roles
+            ],
+            dtype=float,
+        )
+        im = ax.imshow(matrix, vmin=0.0, vmax=1.0, cmap="Blues", aspect="equal")
+        ax.set_title(
+            f"{preset_name}\nrole probs="
+            + ", ".join(f"{role}={preset.role_probs[role]:.2f}" for role in roles)
+        )
+        ax.set_xticks(range(len(roles)), roles, rotation=30, ha="right")
+        ax.set_yticks(range(len(roles)), roles)
+        for row_idx, role_i in enumerate(roles):
+            for col_idx, role_j in enumerate(roles):
+                ax.text(col_idx, row_idx, f"{matrix[row_idx, col_idx]:.3f}", ha="center", va="center", color="black")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Expected edge probability")
+
+    for ax in axes.flatten()[len(presets):]:
+        ax.axis("off")
+
+    fig.suptitle("Role-block average network heatmap", fontsize=14)
+    fig.tight_layout()
+    out_path = output_dir / "role_block_average_network_heatmap.png"
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return out_path
@@ -730,6 +935,7 @@ def write_run_manifest(
             "raw_simulation_output": str(output_dir / RAW_OUTPUT_FILENAME),
             "pair_metrics_rows_csv": str(output_dir / "pair_metrics_rows.csv"),
             "category_metrics_rows_csv": str(output_dir / "category_metrics_rows.csv"),
+            "lowest_marginal_cost_rows_csv": str(output_dir / "lowest_marginal_cost_rows.csv"),
             "routing_behavior_rows_csv": str(output_dir / "routing_behavior_rows.csv"),
             "images": [str(path) for path in image_paths],
         },
@@ -750,11 +956,16 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
             "raw_results_by_preset": analysis_payload["raw_results_by_preset"],
             "pair_metrics_rows": analysis_payload["pair_metrics_rows"],
             "category_metrics_rows": analysis_payload["category_metrics_rows"],
+            "lowest_marginal_cost_rows": analysis_payload["lowest_marginal_cost_rows"],
             "routing_behavior_rows": analysis_payload["routing_behavior_rows"],
         },
     )
+    lowest_marginal_cost_path = plot_lowest_marginal_cost_grid(
+        analysis_payload["lowest_marginal_cost_rows"],
+        output_dir,
+    )
     category_metric_path = plot_category_metric_summary(analysis_payload["category_metrics_rows"], output_dir)
-    marginal_price_impact_path = plot_marginal_price_impact_summary(
+    marginal_price_path = plot_marginal_price_impact_summary(
         analysis_payload["category_metrics_rows"],
         output_dir,
     )
@@ -762,20 +973,30 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
         analysis_payload["pair_metrics_rows"],
         output_dir,
     )
+    role_block_heatmap_path = plot_role_block_average_network_heatmap(output_dir)
     routing_behavior_path = plot_routing_behavior(analysis_payload["routing_behavior_rows"], output_dir)
     manifest_path = write_run_manifest(
         output_dir,
         analysis_payload,
-        [category_metric_path, marginal_price_impact_path, liquidity_contraction_path, routing_behavior_path],
+        [
+            lowest_marginal_cost_path,
+            category_metric_path,
+            marginal_price_path,
+            liquidity_contraction_path,
+            role_block_heatmap_path,
+            routing_behavior_path,
+        ],
     )
     return {
         **analysis_payload,
         "raw_output_path": raw_output_path,
         "manifest_path": manifest_path,
         "image_paths": [
+            lowest_marginal_cost_path,
             category_metric_path,
-            marginal_price_impact_path,
+            marginal_price_path,
             liquidity_contraction_path,
+            role_block_heatmap_path,
             routing_behavior_path,
         ],
     }
