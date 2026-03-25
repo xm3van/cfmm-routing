@@ -183,7 +183,14 @@ def build_generator(config: ExperimentConfig, seed: int) -> SBMGenerator:
     return SBMGenerator(topology_model=topology_model, node_model=node_model, edge_model=edge_model)
 
 
-def build_experiment_config(topology_preset: str) -> ExperimentConfig:
+def build_experiment_config(
+    topology_preset: str,
+    *,
+    n_nodes: int = 28,
+    seeds: tuple[int, ...] = (3, 4, 5),
+    pair_sampling_policy: PairSamplingPolicy = DEFAULT_PAIR_SAMPLING_POLICY,
+    trade_size_grid: tuple[float, ...] = DEFAULT_TRADE_SIZE_GRID,
+) -> ExperimentConfig:
     if topology_preset not in TOPOLOGY_PRESETS:
         raise KeyError(f"Unknown topology preset: {topology_preset}")
 
@@ -191,15 +198,15 @@ def build_experiment_config(topology_preset: str) -> ExperimentConfig:
     return ExperimentConfig(
         varied_parameter=VariedParameter(name="topology_preset", value=topology_preset),
         fixed_parameters={
-            "n_nodes": 28,
+            "n_nodes": int(n_nodes),
             "topology_preset": topology_preset,
             "degree_correction": preset.degree_correction,
             "pareto_alpha": preset.pareto_alpha,
             "role_probs": dict(preset.role_probs),
         },
-        seeds=(3, 4, 5),
-        pair_sampling_policy=DEFAULT_PAIR_SAMPLING_POLICY,
-        trade_size_grid=DEFAULT_TRADE_SIZE_GRID,
+        seeds=tuple(seeds),
+        pair_sampling_policy=pair_sampling_policy,
+        trade_size_grid=tuple(float(dx) for dx in trade_size_grid),
         category_definitions=build_exchange_route_categories(),
         routing_config=RoutingConfig(
             solver="SCS",
@@ -360,6 +367,12 @@ def _write_json_gz(path: Path, payload: dict[str, object]) -> None:
 
 def collect_typology_outputs(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
+    *,
+    topology_presets: tuple[str, ...] | None = None,
+    seeds: tuple[int, ...] = (3, 4, 5),
+    trade_size_grid: tuple[float, ...] = DEFAULT_TRADE_SIZE_GRID,
+    n_nodes: int = 28,
+    pair_sampling_policy: PairSamplingPolicy = DEFAULT_PAIR_SAMPLING_POLICY,
 ) -> dict[str, object]:
     pair_metrics_rows: list[dict[str, float | int | str]] = []
     category_metrics_rows: list[dict[str, float | int | str]] = []
@@ -367,8 +380,15 @@ def collect_typology_outputs(
     routing_behavior_rows: list[dict[str, float | int | str]] = []
     raw_results_by_preset: dict[str, dict[str, object]] = {}
 
-    for topology_preset in TOPOLOGY_PRESETS:
-        config = build_experiment_config(topology_preset)
+    presets_to_run = topology_presets if topology_presets is not None else tuple(TOPOLOGY_PRESETS)
+    for topology_preset in presets_to_run:
+        config = build_experiment_config(
+            topology_preset,
+            n_nodes=n_nodes,
+            seeds=seeds,
+            pair_sampling_policy=pair_sampling_policy,
+            trade_size_grid=trade_size_grid,
+        )
         experiment_result = run_experiment(config, build_generator)
         raw_results_by_preset[topology_preset] = {
             "config": {
@@ -613,8 +633,7 @@ def plot_marginal_price_impact_summary(
     categories = sorted({str(row["category"]) for row in marginal_rows})
     ncols = 2
     nrows = max(1, int(np.ceil(len(categories) / ncols)))
-    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(14, max(4, 3.8 * nrows)), sharex=False)
-    axes = np.atleast_1d(axes).reshape(nrows, ncols)
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(14, max(4, 3.8 * nrows)), sharex=False, squeeze=False)
 
     for ax, category in zip(axes.flatten(), categories):
         preset_map: dict[str, dict[float, list[float]]] = {}
@@ -659,63 +678,7 @@ def plot_lowest_marginal_cost_grid(
         value = float(row["lowest_marginal_cost"])
         by_category.setdefault(category, {}).setdefault(preset, {}).setdefault(dx, []).append(value)
 
-    level_metrics = {
-        "avg_price": ("Average price (dy / dx)", None),
-        "price_deterioration": ("Price deterioration vs smallest trade", (0.0, None)),
-        "log_cost": ("Log-cost diagnostic (-log(dy / dx))", None),
-        "routing_cost_diagnostic": ("Routing cost diagnostic (dx / dy)", None),
-    }
-
-    categories = sorted({str(row["category"]) for row in category_metrics_rows})
-    fig, axes = plt.subplots(
-        nrows=len(categories),
-        ncols=4,
-        figsize=(20, max(4, 3.8 * len(categories))),
-        sharex=False,
-    )
-    axes = np.atleast_2d(axes)
-
-    for row_axes, category in zip(axes, categories):
-        category_level_rows = [row for row in level_rows if str(row["category"]) == category]
-
-        for ax, (metric_name, (ylabel, ylim)) in zip(row_axes, level_metrics.items()):
-            preset_map: dict[str, dict[float, list[float]]] = {}
-            for row in category_level_rows:
-                preset = str(row["topology_preset"])
-                dx = float(row["dx"])
-                value = float(row[metric_name])
-                preset_map.setdefault(preset, {}).setdefault(dx, []).append(value)
-            for preset, dx_map in sorted(preset_map.items()):
-                xs = sorted(dx_map)
-                ys = [float(np.mean(dx_map[dx])) for dx in xs]
-                ax.plot(xs, ys, marker="o", linewidth=2, label=preset)
-            ax.set_title(f"{category}\n{ylabel}")
-            ax.set_xlabel("Trade size (dx)")
-            ax.set_ylabel(ylabel)
-            if ylim is not None:
-                ax.set_ylim(*ylim)
-            ax.grid(True, alpha=0.3)
-
-    for ax in axes.flat:
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            ax.legend(frameon=False, fontsize=8)
-            break
-    fig.tight_layout()
-    out_path = output_dir / "category_metric_summary.png"
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
-def plot_marginal_price_impact_summary(
-    category_metrics_rows: list[dict[str, float | int | str]],
-    output_dir: Path,
-) -> Path:
-    import matplotlib.pyplot as plt
-
-    marginal_rows = [row for row in category_metrics_rows if row.get("metric_kind") == "marginal"]
-    categories = sorted({str(row["category"]) for row in marginal_rows})
+    categories = sorted(by_category)
     ncols = 2
     nrows = max(1, int(np.ceil(len(categories) / ncols)))
     fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(14, max(4, 3.8 * nrows)), sharex=False, squeeze=False)
@@ -770,19 +733,34 @@ def plot_pair_liquidity_contraction_distribution(
             dx = float(row["dx"])
             preset_dx_map.setdefault(preset, {}).setdefault(dx, []).append(float(row["price_deterioration"]))
 
+        has_positive_x = False
         for preset, dx_map in sorted(preset_dx_map.items()):
             xs = sorted(dx_map)
             medians = [float(np.median(dx_map[dx])) for dx in xs]
             p10 = [float(np.percentile(dx_map[dx], 10)) for dx in xs]
             p90 = [float(np.percentile(dx_map[dx], 90)) for dx in xs]
-            ax.plot(xs, medians, marker="o", linewidth=2, label=f"{preset} median")
-            ax.fill_between(xs, p10, p90, alpha=0.18)
+
+            filtered = [
+                (x, med, low, high)
+                for x, med, low, high in zip(xs, medians, p10, p90)
+                if x > 0 and all(math.isfinite(v) for v in (x, med, low, high))
+            ]
+            if not filtered:
+                continue
+            has_positive_x = True
+            xvals = [row[0] for row in filtered]
+            medvals = [row[1] for row in filtered]
+            p10vals = [row[2] for row in filtered]
+            p90vals = [row[3] for row in filtered]
+            ax.plot(xvals, medvals, marker="o", linewidth=2, label=f"{preset} median")
+            ax.fill_between(xvals, p10vals, p90vals, alpha=0.18)
 
         ax.set_title(f"Liquidity contraction distribution: {category}")
         ax.set_xlabel("Trade size (dx)")
         ax.set_ylabel("Price deterioration vs smallest trade")
         ax.set_ylim(0.0, 1.0)
-        ax.set_xscale("log")
+        if has_positive_x:
+            ax.set_xscale("log")
         ax.grid(True, alpha=0.3)
 
     for ax in axes.flatten()[len(categories):]:
@@ -1004,6 +982,19 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
 
 def main() -> int:
     run_typology_analysis()
+
+    # Resource-light smoke configuration for local testing (keep commented out):
+    # small_output_dir = Path("outputs/experiment_01_network_typology_smoke")
+    # analysis_payload = collect_typology_outputs(
+    #     small_output_dir,
+    #     topology_presets=("balanced",),
+    #     seeds=(3,),
+    #     trade_size_grid=(1.0, 10.0, 100.0),
+    #     n_nodes=14,
+    #     pair_sampling_policy=PairSamplingPolicy(mode="random", max_pairs_per_category=24),
+    # )
+    # plot_lowest_marginal_cost_grid(analysis_payload["lowest_marginal_cost_rows"], small_output_dir)
+
     return 0
 
 
