@@ -8,7 +8,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from itertools import combinations_with_replacement
 from pathlib import Path
 
 import numpy as np
@@ -218,11 +217,12 @@ def build_experiment_config(
 def build_exchange_route_categories(token_types: tuple[str, ...] = TOKEN_TYPES) -> tuple[CategoryDefinition, ...]:
     return tuple(
         CategoryDefinition(
-            name=f"{source_token_type}<->{target_token_type}",
+            name=f"{source_token_type}->{target_token_type}",
             source_token_types=(source_token_type,),
             target_token_types=(target_token_type,),
         )
-        for source_token_type, target_token_type in combinations_with_replacement(token_types, 2)
+        for source_token_type in token_types
+        for target_token_type in token_types
     )
 
 
@@ -820,17 +820,47 @@ def plot_role_block_average_network_heatmap(output_dir: Path) -> Path:
     return out_path
 
 
+def _format_edge_category_label(route_edge_category: str) -> str:
+    if route_edge_category == "unknown":
+        return route_edge_category
+    if "__" not in route_edge_category:
+        return route_edge_category
+    left, right = route_edge_category.split("__", maxsplit=1)
+    return f"{left}<->{right}"
+
+
+def _all_edge_categories() -> tuple[str, ...]:
+    categories: list[str] = []
+    for i, left in enumerate(TOKEN_TYPES):
+        for right in TOKEN_TYPES[i:]:
+            categories.append("__".join(sorted((left, right))))
+    return tuple(categories)
+
+
 def plot_routing_behavior(routing_behavior_rows: list[dict[str, float | int | str]], output_dir: Path) -> Path:
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 
     by_category: dict[str, dict[str, dict[str, dict[float, float]]]] = {}
+    observed_edge_categories: set[str] = set()
     for row in routing_behavior_rows:
         category = str(row["category"])
         preset = str(row["topology_preset"])
         route_edge_category = str(row["route_edge_category"])
         dx = float(row["dx"])
+        observed_edge_categories.add(route_edge_category)
         by_category.setdefault(category, {}).setdefault(preset, {}).setdefault(route_edge_category, {}).setdefault(dx, 0.0)
         by_category[category][preset][route_edge_category][dx] += float(row["flow"])
+
+    default_edge_categories = _all_edge_categories()
+    route_edge_categories = sorted(set(default_edge_categories) | observed_edge_categories)
+    color_lookup = {
+        edge_category: color
+        for edge_category, color in zip(
+            route_edge_categories,
+            plt.cm.tab20(np.linspace(0.0, 1.0, len(route_edge_categories), endpoint=False)),
+        )
+    }
 
     categories = sorted(by_category)
     presets = sorted(TOPOLOGY_PRESETS)
@@ -845,17 +875,8 @@ def plot_routing_behavior(routing_behavior_rows: list[dict[str, float | int | st
         squeeze=False,
     )
 
-    legend_handles = None
-    legend_labels = None
     for row_idx, category in enumerate(categories):
         preset_map = by_category[category]
-        route_edge_categories = sorted(
-            {
-                route_edge_category
-                for edge_category_map in preset_map.values()
-                for route_edge_category in edge_category_map
-            }
-        )
         for col_idx, preset in enumerate(presets):
             ax = axes[row_idx, col_idx]
             edge_category_map = preset_map.get(preset, {})
@@ -876,9 +897,13 @@ def plot_routing_behavior(routing_behavior_rows: list[dict[str, float | int | st
                 stacked_shares.append(shares)
 
             if dxs and stacked_shares:
-                ax.stackplot(dxs, stacked_shares, labels=route_edge_categories, alpha=0.85)
-                if legend_handles is None or legend_labels is None:
-                    legend_handles, legend_labels = ax.get_legend_handles_labels()
+                ax.stackplot(
+                    dxs,
+                    stacked_shares,
+                    labels=[_format_edge_category_label(edge_category) for edge_category in route_edge_categories],
+                    colors=[color_lookup[edge_category] for edge_category in route_edge_categories],
+                    alpha=0.85,
+                )
             else:
                 ax.text(0.5, 0.5, "No routed flow", ha="center", va="center", transform=ax.transAxes, fontsize=9)
 
@@ -889,8 +914,15 @@ def plot_routing_behavior(routing_behavior_rows: list[dict[str, float | int | st
             ax.set_ylim(0, 1)
             ax.grid(True, alpha=0.2)
 
-    if legend_handles and legend_labels:
-        fig.legend(legend_handles, legend_labels, frameon=False, loc="upper center", ncol=min(4, len(legend_labels)))
+    handles = [
+        Patch(
+            color=color_lookup[edge_category],
+            label=_format_edge_category_label(edge_category),
+        )
+        for edge_category in route_edge_categories
+    ]
+    if handles:
+        fig.legend(handles=handles, frameon=False, loc="upper center", ncol=min(5, len(handles)))
     fig.tight_layout()
     out_path = output_dir / "routing_behaviour_summary.png"
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -947,10 +979,6 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
         analysis_payload["category_metrics_rows"],
         output_dir,
     )
-    liquidity_contraction_path = plot_pair_liquidity_contraction_distribution(
-        analysis_payload["pair_metrics_rows"],
-        output_dir,
-    )
     role_block_heatmap_path = plot_role_block_average_network_heatmap(output_dir)
     routing_behavior_path = plot_routing_behavior(analysis_payload["routing_behavior_rows"], output_dir)
     manifest_path = write_run_manifest(
@@ -960,7 +988,6 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
             lowest_marginal_cost_path,
             category_metric_path,
             marginal_price_path,
-            liquidity_contraction_path,
             role_block_heatmap_path,
             routing_behavior_path,
         ],
@@ -973,7 +1000,6 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
             lowest_marginal_cost_path,
             category_metric_path,
             marginal_price_path,
-            liquidity_contraction_path,
             role_block_heatmap_path,
             routing_behavior_path,
         ],
@@ -991,7 +1017,7 @@ def main() -> int:
     #     seeds=(3,),
     #     trade_size_grid=(1.0, 10.0, 100.0),
     #     n_nodes=14,
-    #     pair_sampling_policy=PairSamplingPolicy(mode="random", max_pairs_per_category=24),
+    #     pair_sampling_policy=PairSamplingPolicy(mode="sample", max_pairs_per_category=24),
     # )
     # plot_lowest_marginal_cost_grid(analysis_payload["lowest_marginal_cost_rows"], small_output_dir)
 
