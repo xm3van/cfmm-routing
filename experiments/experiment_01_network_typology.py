@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import networkx as nx
 import numpy as np
 
 from cfmm_routing.config import RoutingConfig, SweepConfig
@@ -256,6 +257,14 @@ def _normalized_avg_price(avg_price: float, baseline_avg_price: float) -> float:
     return avg_price / baseline_avg_price
 
 
+def _shannon_entropy(values: list[float]) -> float:
+    total = float(sum(v for v in values if v > 0))
+    if total <= 0:
+        return float("nan")
+    probs = [v / total for v in values if v > 0]
+    return float(-sum(p * math.log(p) for p in probs if p > 0))
+
+
 def _append_metric_rows(
     rows: list[dict[str, float | int | str]],
     grouped_rows: dict[tuple[object, ...], list[dict[str, object]]],
@@ -378,6 +387,7 @@ def collect_typology_outputs(
     category_metrics_rows: list[dict[str, float | int | str]] = []
     lowest_marginal_cost_rows: list[dict[str, float | int | str]] = []
     routing_behavior_rows: list[dict[str, float | int | str]] = []
+    routing_path_metrics_rows: list[dict[str, float | int | str]] = []
     raw_results_by_preset: dict[str, dict[str, object]] = {}
 
     presets_to_run = topology_presets if topology_presets is not None else tuple(TOPOLOGY_PRESETS)
@@ -477,6 +487,19 @@ def collect_typology_outputs(
                     config.pair_sampling_policy,
                     seed=seed,
                 ):
+                    baseline_shortest_hops = float("nan")
+                    if source_asset in artifacts.graph and target_asset in artifacts.graph:
+                        try:
+                            baseline_shortest_hops = float(
+                                nx.shortest_path_length(
+                                    artifacts.graph,
+                                    source=int(source_asset),
+                                    target=int(target_asset),
+                                )
+                            )
+                        except nx.NetworkXNoPath:
+                            baseline_shortest_hops = float("nan")
+
                     sweep_result = run_sweep(
                         market_cfg=artifacts.market_config,
                         routing_cfg=config.routing_config,
@@ -493,6 +516,57 @@ def collect_typology_outputs(
                             mode="sum",
                         )
                         total_flow = sum(flow_by_edge_category.values()) or 1.0
+                        active_pool_uids = {
+                            pool_uid
+                            for pool_uid, value in pool_out.items()
+                            if float(value) > 0
+                        }
+                        routed_graph = nx.Graph()
+                        routed_graph.add_nodes_from((int(source_asset), int(target_asset)))
+                        for pool in artifacts.market_config.pools:
+                            if pool.uid not in active_pool_uids:
+                                continue
+                            routed_graph.add_edge(int(pool.i), int(pool.j))
+                        routed_shortest_hops = float("nan")
+                        if routed_graph.has_node(int(source_asset)) and routed_graph.has_node(int(target_asset)):
+                            try:
+                                routed_shortest_hops = float(
+                                    nx.shortest_path_length(
+                                        routed_graph,
+                                        source=int(source_asset),
+                                        target=int(target_asset),
+                                    )
+                                )
+                            except nx.NetworkXNoPath:
+                                routed_shortest_hops = float("nan")
+                        edge_flow_values = [float(flow) for flow in flow_by_edge_category.values() if float(flow) > 0]
+                        route_entropy = _shannon_entropy(edge_flow_values)
+                        max_edge_share = (
+                            float(max(edge_flow_values) / total_flow)
+                            if edge_flow_values and total_flow > 0
+                            else float("nan")
+                        )
+                        excess_hops = (
+                            routed_shortest_hops - baseline_shortest_hops
+                            if math.isfinite(routed_shortest_hops) and math.isfinite(baseline_shortest_hops)
+                            else float("nan")
+                        )
+                        routing_path_metrics_rows.append(
+                            {
+                                "topology_preset": topology_preset,
+                                "seed": seed,
+                                "category": category_name,
+                                "dx": float(dx),
+                                "source_asset": int(source_asset),
+                                "target_asset": int(target_asset),
+                                "baseline_shortest_hops": baseline_shortest_hops,
+                                "routed_shortest_hops": routed_shortest_hops,
+                                "excess_hops": excess_hops,
+                                "active_pool_count": len(active_pool_uids),
+                                "route_entropy": route_entropy,
+                                "max_edge_share": max_edge_share,
+                            }
+                        )
                         for route_edge_category, flow in sorted(flow_by_edge_category.items()):
                             routing_behavior_rows.append(
                                 {
@@ -539,6 +613,7 @@ def collect_typology_outputs(
     write_csv(str(output_dir / "category_metrics_rows.csv"), category_metrics_rows)
     write_csv(str(output_dir / "lowest_marginal_cost_rows.csv"), lowest_marginal_cost_rows)
     write_csv(str(output_dir / "routing_behavior_rows.csv"), routing_behavior_rows)
+    write_csv(str(output_dir / "routing_path_metrics_rows.csv"), routing_path_metrics_rows)
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "experiment_name": "experiment_01_network_typology",
@@ -547,6 +622,7 @@ def collect_typology_outputs(
         "category_metrics_rows": category_metrics_rows,
         "lowest_marginal_cost_rows": lowest_marginal_cost_rows,
         "routing_behavior_rows": routing_behavior_rows,
+        "routing_path_metrics_rows": routing_path_metrics_rows,
     }
 
 
@@ -930,6 +1006,64 @@ def plot_routing_behavior(routing_behavior_rows: list[dict[str, float | int | st
     return out_path
 
 
+def plot_routing_path_metrics_summary(
+    routing_path_metrics_rows: list[dict[str, float | int | str]],
+    output_dir: Path,
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    metrics = {
+        "excess_hops": "Excess hops (routed shortest - baseline shortest)",
+        "route_entropy": "Route entropy over active edge-category flow",
+    }
+    categories = sorted({str(row["category"]) for row in routing_path_metrics_rows})
+    fig, axes = plt.subplots(
+        nrows=max(1, len(categories)),
+        ncols=2,
+        figsize=(14, max(4, 3.5 * max(1, len(categories)))),
+        squeeze=False,
+        sharex=False,
+    )
+
+    for row_idx, category in enumerate(categories):
+        category_rows = [row for row in routing_path_metrics_rows if str(row["category"]) == category]
+        for col_idx, (metric_name, ylabel) in enumerate(metrics.items()):
+            ax = axes[row_idx, col_idx]
+            preset_map: dict[str, dict[float, list[float]]] = {}
+            for row in category_rows:
+                value = float(row[metric_name])
+                if not math.isfinite(value):
+                    continue
+                preset = str(row["topology_preset"])
+                dx = float(row["dx"])
+                preset_map.setdefault(preset, {}).setdefault(dx, []).append(value)
+
+            for preset, dx_map in sorted(preset_map.items()):
+                xs = sorted(dx_map)
+                ys = np.array([float(np.mean(dx_map[dx])) for dx in xs], dtype=float)
+                std = np.array([float(np.std(dx_map[dx], ddof=0)) for dx in xs], dtype=float)
+                ax.plot(xs, ys, marker="o", linewidth=2, label=preset)
+                ax.fill_between(xs, ys - std, ys + std, alpha=0.15)
+
+            ax.set_title(f"{category}\n{ylabel}")
+            ax.set_xlabel("Trade size (dx)")
+            ax.set_ylabel(ylabel)
+            ax.set_xscale("log")
+            ax.grid(True, alpha=0.25)
+
+    for ax in axes.flatten()[len(categories) * 2:]:
+        ax.axis("off")
+    if categories:
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, frameon=False, loc="upper center", ncol=min(4, len(labels)))
+    fig.tight_layout()
+    out_path = output_dir / "routing_path_metrics_summary.png"
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def write_run_manifest(
     output_dir: Path,
     analysis_payload: dict[str, object],
@@ -947,6 +1081,7 @@ def write_run_manifest(
             "category_metrics_rows_csv": str(output_dir / "category_metrics_rows.csv"),
             "lowest_marginal_cost_rows_csv": str(output_dir / "lowest_marginal_cost_rows.csv"),
             "routing_behavior_rows_csv": str(output_dir / "routing_behavior_rows.csv"),
+            "routing_path_metrics_rows_csv": str(output_dir / "routing_path_metrics_rows.csv"),
             "images": [str(path) for path in image_paths],
         },
     }
@@ -968,6 +1103,7 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
             "category_metrics_rows": analysis_payload["category_metrics_rows"],
             "lowest_marginal_cost_rows": analysis_payload["lowest_marginal_cost_rows"],
             "routing_behavior_rows": analysis_payload["routing_behavior_rows"],
+            "routing_path_metrics_rows": analysis_payload["routing_path_metrics_rows"],
         },
     )
     lowest_marginal_cost_path = plot_lowest_marginal_cost_grid(
@@ -981,6 +1117,10 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
     )
     role_block_heatmap_path = plot_role_block_average_network_heatmap(output_dir)
     routing_behavior_path = plot_routing_behavior(analysis_payload["routing_behavior_rows"], output_dir)
+    routing_path_metrics_path = plot_routing_path_metrics_summary(
+        analysis_payload["routing_path_metrics_rows"],
+        output_dir,
+    )
     manifest_path = write_run_manifest(
         output_dir,
         analysis_payload,
@@ -990,6 +1130,7 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
             marginal_price_path,
             role_block_heatmap_path,
             routing_behavior_path,
+            routing_path_metrics_path,
         ],
     )
     return {
@@ -1002,6 +1143,7 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
             marginal_price_path,
             role_block_heatmap_path,
             routing_behavior_path,
+            routing_path_metrics_path,
         ],
     }
 
