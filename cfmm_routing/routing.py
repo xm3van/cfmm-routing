@@ -24,6 +24,20 @@ class FlowResult:
     solver_info: Dict[str, object]
 
 
+@dataclass
+class _CompiledMaxOutProblem:
+    mkt: Market
+    in_asset: int
+    out_asset: int
+    flow_scale: float
+    dx_param: cp.Parameter
+    psi: cp.Expression
+    deltas: List[cp.Variable]
+    lambdas: List[cp.Variable]
+    local_assets_list: List[List[int]]
+    prob: cp.Problem
+
+
 def _pool_local_assets(p: PoolSpec) -> List[int]:
     # current codebase: all pools are 2-asset (i, j)
     return [p.i, p.j]
@@ -115,22 +129,17 @@ def _pool_invariant_constraint(p: PoolSpec, R: np.ndarray, new_R: cp.Expression)
     return cons
 
 
-def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, rcfg: RoutingConfig) -> FlowResult:
+def _build_compiled_max_out_problem(mkt: Market, in_asset: int, out_asset: int) -> _CompiledMaxOutProblem:
     n = int(mkt.n_assets)
     pools = mkt.pools
 
     if len(pools) == 0:
-        return FlowResult(
-            status="infeasible",
-            dy_total=0.0,
-            pool_in={},
-            pool_out_to_sink={},
-            solver_info={"reason": "no pools"},
-        )
+        raise ValueError("Cannot compile max-out problem with empty pool set")
 
     # Homogeneous scaling improves conditioning for conic solvers when
-    # reserves/endowment are very large (common in on-chain units).
-    reserve_scale_candidates = [abs(float(dx_total))]
+    # reserves/endowment are very large (common in on-chain units). Since dx is
+    # a runtime parameter, scaling here depends only on market reserves.
+    reserve_scale_candidates = [1.0]
     for p in pools:
         reserve_scale_candidates.extend(abs(float(r)) for r in _pool_reserves(p, _pool_local_assets(p)))
     flow_scale = max(1.0, max(reserve_scale_candidates, default=1.0))
@@ -165,9 +174,10 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
     cons: List[cp.Constraint] = []
 
     # paper endowment constraint
+    dx_param = cp.Parameter(nonneg=True, value=0.0)
     w = np.zeros(n, dtype=float)
-    w[in_asset] = float(dx_total) / flow_scale
-    cons.append(psi + w >= 0)
+    w[in_asset] = 1.0
+    cons.append(psi + dx_param * w >= 0)
 
     # pool constraints
     for p, R, gamma_k, D, L in zip(pools, reserves_list, gamma_list, deltas, lambdas):
@@ -175,6 +185,45 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
         cons.extend(_pool_invariant_constraint(p, R, new_R))
 
     prob = cp.Problem(obj, cons)
+    return _CompiledMaxOutProblem(
+        mkt=mkt,
+        in_asset=int(in_asset),
+        out_asset=int(out_asset),
+        flow_scale=float(flow_scale),
+        dx_param=dx_param,
+        psi=psi,
+        deltas=deltas,
+        lambdas=lambdas,
+        local_assets_list=local_assets_list,
+        prob=prob,
+    )
+
+
+def _solve_compiled_max_out_problem(
+    compiled: _CompiledMaxOutProblem,
+    dx_total: float,
+    rcfg: RoutingConfig,
+) -> FlowResult:
+    pools = compiled.mkt.pools
+    if len(pools) == 0:
+        return FlowResult(
+            status="infeasible",
+            dy_total=0.0,
+            pool_in={},
+            pool_out_to_sink={},
+            solver_info={"reason": "no pools"},
+        )
+
+    if dx_total < 0:
+        return FlowResult(
+            status="error",
+            dy_total=0.0,
+            pool_in={},
+            pool_out_to_sink={},
+            solver_info={"reason": "dx_total must be non-negative"},
+        )
+
+    compiled.dx_param.value = float(dx_total) / compiled.flow_scale
 
     solve_errors: List[Dict[str, str]] = []
     selected_solver = rcfg.solver
@@ -198,13 +247,13 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
     for solver in solvers_to_try:
         selected_solver = solver
         try:
-            prob.solve(solver=solver, **rcfg.solver_opts)
+            compiled.prob.solve(solver=solver, warm_start=True, **rcfg.solver_opts)
         except Exception as e:
             solve_errors.append({"solver": solver, "exception": repr(e)})
             continue
 
-        status = str(prob.status)
-        if prob.value is not None and status in ("optimal", "optimal_inaccurate"):
+        status = str(compiled.prob.status)
+        if compiled.prob.value is not None and status in ("optimal", "optimal_inaccurate"):
             break
 
         solve_errors.append({
@@ -226,8 +275,12 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
             },
         )
 
-    if prob.value is None or status not in ("optimal", "optimal_inaccurate"):
-        spent = float(-psi.value[in_asset] * flow_scale) if psi.value is not None else 0.0
+    if compiled.prob.value is None or status not in ("optimal", "optimal_inaccurate"):
+        spent = (
+            float(-compiled.psi.value[compiled.in_asset] * compiled.flow_scale)
+            if compiled.psi.value is not None
+            else 0.0
+        )
         return FlowResult(
             status=status,
             dy_total=0.0,
@@ -243,23 +296,36 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
         )
 
     # compute spent/received AFTER solve
-    spent = float(-psi.value[in_asset] * flow_scale) if psi.value is not None else 0.0
-    received = float(psi.value[out_asset] * flow_scale) if psi.value is not None else 0.0
+    spent = (
+        float(-compiled.psi.value[compiled.in_asset] * compiled.flow_scale)
+        if compiled.psi.value is not None
+        else 0.0
+    )
+    received = (
+        float(compiled.psi.value[compiled.out_asset] * compiled.flow_scale)
+        if compiled.psi.value is not None
+        else 0.0
+    )
 
     pool_in: Dict[str, float] = {}
     pool_out_to_sink: Dict[str, float] = {}
 
-    for p, local_assets, D, L in zip(pools, local_assets_list, deltas, lambdas):
+    for p, local_assets, D, L in zip(
+        pools,
+        compiled.local_assets_list,
+        compiled.deltas,
+        compiled.lambdas,
+    ):
         uid = p.uid
         Dv = np.array(D.value).astype(float) if D.value is not None else np.zeros(len(local_assets))
         Lv = np.array(L.value).astype(float) if L.value is not None else np.zeros(len(local_assets))
 
-        pool_in[uid] = float(np.sum(Dv) * flow_scale)
+        pool_in[uid] = float(np.sum(Dv) * compiled.flow_scale)
 
         contrib = 0.0
-        if out_asset in local_assets:
-            t = local_assets.index(out_asset)
-            contrib = float((Lv[t] - Dv[t]) * flow_scale)
+        if compiled.out_asset in local_assets:
+            t = local_assets.index(compiled.out_asset)
+            contrib = float((Lv[t] - Dv[t]) * compiled.flow_scale)
             if contrib < 0:
                 contrib = 0.0
         pool_out_to_sink[uid] = contrib
@@ -278,3 +344,38 @@ def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, r
             "exceptions": solve_errors,
         },
     )
+
+
+def solve_max_out(mkt: Market, in_asset: int, out_asset: int, dx_total: float, rcfg: RoutingConfig) -> FlowResult:
+    if len(mkt.pools) == 0:
+        return FlowResult(
+            status="infeasible",
+            dy_total=0.0,
+            pool_in={},
+            pool_out_to_sink={},
+            solver_info={"reason": "no pools"},
+        )
+    compiled = _build_compiled_max_out_problem(mkt, in_asset, out_asset)
+    return _solve_compiled_max_out_problem(compiled, dx_total, rcfg)
+
+
+def solve_max_out_sweep(
+    mkt: Market,
+    in_asset: int,
+    out_asset: int,
+    dx_values: List[float],
+    rcfg: RoutingConfig,
+) -> List[FlowResult]:
+    if len(mkt.pools) == 0:
+        return [
+            FlowResult(
+                status="infeasible",
+                dy_total=0.0,
+                pool_in={},
+                pool_out_to_sink={},
+                solver_info={"reason": "no pools"},
+            )
+            for _ in dx_values
+        ]
+    compiled = _build_compiled_max_out_problem(mkt, in_asset, out_asset)
+    return [_solve_compiled_max_out_problem(compiled, float(dx), rcfg) for dx in dx_values]

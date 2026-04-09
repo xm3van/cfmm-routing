@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import os
-from cfmm_routing.config import MarketConfig, RoutingConfig, SweepConfig, HarnessConfig, as_dict
+from cfmm_routing.config import MarketConfig, RoutingConfig, SweepConfig
 from .market import build_market
-from .routing import solve_max_out
+from .routing import solve_max_out_sweep
 
 def run_sweep(
     *,
@@ -15,8 +14,14 @@ def run_sweep(
 
     dys = []
     comp = []
-    for dx in sweep_cfg.dx_grid:
-        fr = solve_max_out(mkt, sweep_cfg.in_asset, sweep_cfg.out_asset, dx, routing_cfg)
+    flow_results = solve_max_out_sweep(
+        mkt,
+        sweep_cfg.in_asset,
+        sweep_cfg.out_asset,
+        [float(dx) for dx in sweep_cfg.dx_grid],
+        routing_cfg,
+    )
+    for dx, fr in zip(sweep_cfg.dx_grid, flow_results):
         if fr.status not in ("optimal", "optimal_inaccurate"):
             raise RuntimeError(f"Solve failed at dx={dx}: {fr.status} {fr.solver_info}")
         dys.append(fr.dy_total)
