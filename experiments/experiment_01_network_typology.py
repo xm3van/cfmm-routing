@@ -57,6 +57,8 @@ DEFAULT_PARETO_ALPHA = 2.5
 DEFAULT_PAIR_SAMPLING_POLICY = PairSamplingPolicy(mode="all")
 TOKEN_TYPES: tuple[str, ...] = ("stable", "major", "alt", "meme")
 DEFAULT_TRADE_SIZE_GRID: tuple[float, ...] = tuple(float(dx) for dx in np.geomspace(1.0, 10_000.0, num=16))
+DEFAULT_SEEDS: tuple[int, ...] = tuple(range(3, 27))  # 24 seeds
+MARGINAL_AVG_PRICE_FLOOR = 1e-9
 DEFAULT_OUTPUT_DIR = Path("outputs/experiment_01_network_typology")
 RAW_OUTPUT_FILENAME = "raw_simulation_output.json.gz"
 MANIFEST_FILENAME = "run_manifest.json"
@@ -187,7 +189,7 @@ def build_experiment_config(
     topology_preset: str,
     *,
     n_nodes: int = 28,
-    seeds: tuple[int, ...] = (3, 4, 5),
+    seeds: tuple[int, ...] = DEFAULT_SEEDS,
     pair_sampling_policy: PairSamplingPolicy = DEFAULT_PAIR_SAMPLING_POLICY,
     trade_size_grid: tuple[float, ...] = DEFAULT_TRADE_SIZE_GRID,
 ) -> ExperimentConfig:
@@ -318,6 +320,11 @@ def _append_metric_rows(
                 marginal_avg_price = (dy_curr - dy_prev) / ddx
                 if baseline_avg_price > 0 and math.isfinite(baseline_avg_price):
                     marginal_price_impact = max(0.0, 1.0 - (marginal_avg_price / baseline_avg_price))
+            marginal_avg_price_floored = (
+                max(MARGINAL_AVG_PRICE_FLOOR, marginal_avg_price)
+                if math.isfinite(marginal_avg_price)
+                else float("nan")
+            )
             rows.append(
                 {
                     **metadata,
@@ -335,9 +342,10 @@ def _append_metric_rows(
                     "dx_left": dx_prev,
                     "dx_right": dx_curr,
                     "marginal_avg_price": marginal_avg_price,
+                    "marginal_avg_price_floored": marginal_avg_price_floored,
                     "marginal_price_impact": marginal_price_impact,
                     "marginal_log_cost": _log_cost(marginal_avg_price),
-                    "marginal_cost": _routing_cost(1.0, marginal_avg_price),
+                    "marginal_cost": _routing_cost(1.0, marginal_avg_price_floored),
                 }
             )
 
@@ -378,7 +386,7 @@ def collect_typology_outputs(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     *,
     topology_presets: tuple[str, ...] | None = None,
-    seeds: tuple[int, ...] = (3, 4, 5),
+    seeds: tuple[int, ...] = DEFAULT_SEEDS,
     trade_size_grid: tuple[float, ...] = DEFAULT_TRADE_SIZE_GRID,
     n_nodes: int = 28,
     pair_sampling_policy: PairSamplingPolicy = DEFAULT_PAIR_SAMPLING_POLICY,
