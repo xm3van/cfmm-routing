@@ -57,6 +57,9 @@ DEFAULT_PARETO_ALPHA = 2.5
 DEFAULT_PAIR_SAMPLING_POLICY = PairSamplingPolicy(mode="all")
 TOKEN_TYPES: tuple[str, ...] = ("stable", "major", "alt", "meme")
 DEFAULT_TRADE_SIZE_GRID: tuple[float, ...] = tuple(float(dx) for dx in np.geomspace(1.0, 10_000.0, num=16))
+DEFAULT_SEEDS: tuple[int, ...] = tuple(range(3, 27))  # 24 seeds
+MARGINAL_AVG_PRICE_FLOOR = 1e-9
+FRONTIER_PAIR_COST_QUANTILE = 0.10  # robust "best-route frontier" within each seed/category/dx
 DEFAULT_OUTPUT_DIR = Path("outputs/experiment_01_network_typology")
 RAW_OUTPUT_FILENAME = "raw_simulation_output.json.gz"
 MANIFEST_FILENAME = "run_manifest.json"
@@ -187,7 +190,7 @@ def build_experiment_config(
     topology_preset: str,
     *,
     n_nodes: int = 28,
-    seeds: tuple[int, ...] = (3, 4, 5),
+    seeds: tuple[int, ...] = DEFAULT_SEEDS,
     pair_sampling_policy: PairSamplingPolicy = DEFAULT_PAIR_SAMPLING_POLICY,
     trade_size_grid: tuple[float, ...] = DEFAULT_TRADE_SIZE_GRID,
 ) -> ExperimentConfig:
@@ -318,6 +321,11 @@ def _append_metric_rows(
                 marginal_avg_price = (dy_curr - dy_prev) / ddx
                 if baseline_avg_price > 0 and math.isfinite(baseline_avg_price):
                     marginal_price_impact = max(0.0, 1.0 - (marginal_avg_price / baseline_avg_price))
+            marginal_avg_price_floored = (
+                max(MARGINAL_AVG_PRICE_FLOOR, marginal_avg_price)
+                if math.isfinite(marginal_avg_price)
+                else float("nan")
+            )
             rows.append(
                 {
                     **metadata,
@@ -335,9 +343,10 @@ def _append_metric_rows(
                     "dx_left": dx_prev,
                     "dx_right": dx_curr,
                     "marginal_avg_price": marginal_avg_price,
+                    "marginal_avg_price_floored": marginal_avg_price_floored,
                     "marginal_price_impact": marginal_price_impact,
                     "marginal_log_cost": _log_cost(marginal_avg_price),
-                    "marginal_cost": _routing_cost(1.0, marginal_avg_price),
+                    "marginal_cost": _routing_cost(1.0, marginal_avg_price_floored),
                 }
             )
 
@@ -378,7 +387,7 @@ def collect_typology_outputs(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     *,
     topology_presets: tuple[str, ...] | None = None,
-    seeds: tuple[int, ...] = (3, 4, 5),
+    seeds: tuple[int, ...] = DEFAULT_SEEDS,
     trade_size_grid: tuple[float, ...] = DEFAULT_TRADE_SIZE_GRID,
     n_nodes: int = 28,
     pair_sampling_policy: PairSamplingPolicy = DEFAULT_PAIR_SAMPLING_POLICY,
@@ -582,9 +591,12 @@ def collect_typology_outputs(
                                 }
                             )
 
-    lowest_marginal_cost_by_key: dict[tuple[str, int, str, float], float] = {}
+    marginal_cost_values_by_key: dict[tuple[str, int, str, float], list[float]] = {}
     for row in pair_metrics_rows:
         if row.get("metric_kind") != "marginal":
+            continue
+        marginal_cost = float(row["marginal_cost"])
+        if not math.isfinite(marginal_cost) or marginal_cost <= 0:
             continue
         key = (
             str(row["topology_preset"]),
@@ -592,19 +604,23 @@ def collect_typology_outputs(
             str(row["category"]),
             float(row["dx"]),
         )
-        lowest_marginal_cost_by_key[key] = min(
-            lowest_marginal_cost_by_key.get(key, float("inf")),
-            float(row["marginal_cost"]),
-        )
+        marginal_cost_values_by_key.setdefault(key, []).append(marginal_cost)
 
-    for (topology_preset, seed, category, dx), marginal_cost in sorted(lowest_marginal_cost_by_key.items()):
+    for (topology_preset, seed, category, dx), marginal_costs in sorted(marginal_cost_values_by_key.items()):
+        costs = np.array(marginal_costs, dtype=float)
+        frontier_cost = float(np.quantile(costs, FRONTIER_PAIR_COST_QUANTILE))
+        pair_median_cost = float(np.median(costs))
         lowest_marginal_cost_rows.append(
             {
                 "topology_preset": topology_preset,
                 "seed": seed,
                 "category": category,
                 "dx": dx,
-                "lowest_marginal_cost": marginal_cost,
+                # Backward-compatible column name retained, but now computed as a
+                # robust lower-envelope (quantile frontier) instead of raw minimum.
+                "lowest_marginal_cost": frontier_cost,
+                "pair_median_marginal_cost": pair_median_cost,
+                "pair_count": int(costs.size),
             }
         )
 
@@ -766,14 +782,30 @@ def plot_lowest_marginal_cost_grid(
             if not dx_map:
                 continue
             xs = sorted(dx_map)
-            mean_curve = np.array([float(np.mean(dx_map[dx])) for dx in xs], dtype=float)
-            std_curve = np.array([float(np.std(dx_map[dx], ddof=0)) for dx in xs], dtype=float)
-            ax.plot(xs, mean_curve, marker="o", linewidth=2, label=preset)
-            ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, alpha=0.15)
-        ax.set_title(f"Lowest marginal cost: {category}")
+            center_curve: list[float] = []
+            low_curve: list[float] = []
+            high_curve: list[float] = []
+            filtered_xs: list[float] = []
+            for dx in xs:
+                vals = np.array(
+                    [float(v) for v in dx_map[dx] if math.isfinite(float(v)) and float(v) > 0],
+                    dtype=float,
+                )
+                if vals.size == 0:
+                    continue
+                filtered_xs.append(float(dx))
+                center_curve.append(float(np.median(vals)))
+                low_curve.append(float(np.percentile(vals, 10)))
+                high_curve.append(float(np.percentile(vals, 90)))
+            if not filtered_xs:
+                continue
+            ax.plot(filtered_xs, center_curve, marker="o", linewidth=2, label=preset)
+            ax.fill_between(filtered_xs, low_curve, high_curve, alpha=0.15)
+        ax.set_title(f"Robust frontier marginal cost: {category}")
         ax.set_xlabel("Trade size midpoint")
-        ax.set_ylabel("Lowest marginal cost (1 / (Δdy / Δdx))")
+        ax.set_ylabel("Frontier marginal cost (lower is better)")
         ax.set_xscale("log")
+        ax.set_yscale("log")
         ax.grid(True, alpha=0.25)
 
     for ax in axes.flatten()[len(categories):]:
