@@ -7,7 +7,13 @@ import numpy as np
 import cvxpy as cp
 
 from cfmm_routing.config import RoutingConfig, PoolSpec
-from cfmm_routing.market import Market
+
+@dataclass
+class Market:
+    n_assets: int
+    pools: List[PoolSpec]
+    # adjacency: (i,j) -> list of pool indices
+    adj: Dict[Tuple[int, int], List[int]]
 
 
 _CONIC_FALLBACK_SOLVERS: Tuple[str, ...] = ("CLARABEL", "SCS", "ECOS")
@@ -67,7 +73,15 @@ def _pool_reserves(p: PoolSpec, local_assets: List[int]) -> np.ndarray:
             p.j: float(p.liquidity) * wj / total_w,
         }
         return np.array([reserve_by_asset[idx] for idx in local_assets], dtype=float)
-
+    
+    if p.ptype == "univ3_proxy":
+        alpha = min(max(float(p.params.get("alpha", 0.25)), 1e-6), 1.0 - 1e-6)
+        reserve_by_asset = {
+            p.i: float(p.liquidity) * alpha,
+            p.j: float(p.liquidity) * (1.0 - alpha),
+        }
+        return np.array([reserve_by_asset[idx] for idx in local_assets], dtype=float)
+    
     reserve_ratio = _pool_reserve_param(p, ("reserve_ratio", "price_scale", "peg_offset"))
     if reserve_ratio is not None and reserve_ratio > 0:
         ratio = float(reserve_ratio)
@@ -122,6 +136,35 @@ def _pool_invariant_constraint(p: PoolSpec, R: np.ndarray, new_R: cp.Expression)
         reference_gm = float(np.sqrt(np.prod(R)))
         cons.append(cp.sum(new_R) >= float(np.sum(R)))
         cons.append(cp.geo_mean(new_R) >= gm_floor * reference_gm)
+
+    elif p.ptype == "univ3_proxy":
+        alpha = float(p.params.get("alpha", 0.25))
+        beta = float(p.params.get("beta", 0.60))
+
+        # Clamp to safe range
+        alpha = min(max(alpha, 1e-6), 1.0 - 1e-6)
+        beta = min(max(beta, 1e-6), 1.0 - 1e-6)
+
+        # Concentration intensity:
+        # beta > alpha => more of the local slope comes from a smaller active band.
+        conc = max(0.0, beta - alpha)
+
+        # Reduced-form DCP-safe proxy:
+        # - constant-sum envelope gives flatter near-spot behavior
+        # - gm floor prevents unrealistic one-sided depletion
+        # - stronger concentration => more relaxed gm floor
+        #
+        # beta == alpha collapses toward univ2-like behavior.
+        if conc <= 1e-8:
+            cons.append(cp.geo_mean(new_R) >= cp.geo_mean(R))
+        else:
+            reference_gm = float(np.sqrt(np.prod(R)))
+
+            # Typical range roughly 0.90 .. 1.00
+            gm_floor = max(0.90, min(0.995, 1.0 - 0.18 * conc))
+
+            cons.append(cp.sum(new_R) >= float(np.sum(R)))
+            cons.append(cp.geo_mean(new_R) >= gm_floor * reference_gm)
 
     else:
         raise ValueError(f"Unknown pool type: {p.ptype}")
