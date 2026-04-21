@@ -4,4 +4,6 @@ __pycache__
 .venv
 archive
 .env
+outputs/
+data/geckoterminal/
 
