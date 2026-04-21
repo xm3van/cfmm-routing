@@ -8,6 +8,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import networkx as nx
@@ -37,6 +38,190 @@ from cfmm_routing.sbm import (
 )
 
 
+# ============================================================================
+# Calibration-backed synthetic typology experiment
+# - topology remains synthetic (SBM)
+# - node / edge attributes are sampled from calibration.json
+# - node regimes: usd_like / volatile
+# - pool types match engine dispatch: univ2 / bal_wgm / curve / univ3_proxy
+# ============================================================================
+
+CALIBRATION_PATH = Path("outputs/geckoterminal_calibration_experiment/calibration.json")
+CALIBRATION_WEIGHTING = "liquidity_weighted"  # or "count_weighted"
+
+
+@lru_cache(maxsize=4)
+def load_calibration(path_str: str) -> dict[str, object]:
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Calibration file not found: {path}. "
+            "Generate it first with the calibration script."
+        )
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _normalize_prob_dict(d: dict[str, float]) -> dict[str, float]:
+    total = float(sum(float(v) for v in d.values()))
+    if total <= 0:
+        n = len(d)
+        return {str(k): 1.0 / n for k in d}
+    return {str(k): float(v) / total for k, v in d.items()}
+
+
+def _sample_from_prob_dict(rng, probs: dict[str, float]) -> str:
+    probs = _normalize_prob_dict(probs)
+    keys = list(probs.keys())
+    vals = np.array([probs[k] for k in keys], dtype=float)
+    vals /= vals.sum()
+    return str(rng.choice(keys, p=vals))
+
+
+def _lookup_prob_table(
+    calibration: dict,
+    table_name: str,
+    key: str,
+    weighting: str,
+) -> dict[str, float] | None:
+    table = calibration.get(table_name, {})
+    weighted_table = table.get(weighting, {})
+    return weighted_table.get(key)
+
+
+def _nearest_numeric_key(d: dict, x: float) -> str | None:
+    if not d:
+        return None
+    numeric_keys: list[tuple[float, str]] = []
+    for k in d.keys():
+        try:
+            numeric_keys.append((float(k), str(k)))
+        except Exception:
+            continue
+    if not numeric_keys:
+        return None
+    return min(numeric_keys, key=lambda kv: abs(kv[0] - x))[1]
+
+
+def _find_liquidity_bucket(
+    calibration: dict,
+    role_pair: str,
+    ptype: str,
+    regime_pair: str,
+) -> dict[str, float] | None:
+    """
+    Fallback order:
+      1. exact role_pair | ptype | regime_pair
+      2. any role_pair for same ptype + regime_pair
+      3. any regime_pair for same ptype
+    """
+    buckets = calibration.get("liquidity_distributions", {})
+    exact = buckets.get(f"{role_pair} | {ptype} | {regime_pair}")
+    if exact is not None:
+        return exact
+
+    matches = []
+    for k, v in buckets.items():
+        parts = [x.strip() for x in k.split("|")]
+        if len(parts) != 3:
+            continue
+        rp, pt, gp = parts
+        if pt == ptype and gp == regime_pair:
+            matches.append(v)
+    if matches:
+        return max(matches, key=lambda x: float(x.get("count", 0)))
+
+    matches = []
+    for k, v in buckets.items():
+        parts = [x.strip() for x in k.split("|")]
+        if len(parts) != 3:
+            continue
+        _, pt, _ = parts
+        if pt == ptype:
+            matches.append(v)
+    if matches:
+        return max(matches, key=lambda x: float(x.get("count", 0)))
+
+    return None
+
+
+def _sample_lognormal_from_bucket(
+    rng,
+    bucket: dict[str, float] | None,
+    default_mean: float = 1e6,
+    default_sigma: float = 0.7,
+) -> float:
+    if bucket is None:
+        return float(rng.lognormal(mean=np.log(default_mean), sigma=default_sigma))
+    mu = float(bucket.get("lognormal_mu", np.log(default_mean)))
+    sigma = float(bucket.get("lognormal_sigma", default_sigma))
+    sigma = max(1e-8, sigma)
+    return float(rng.lognormal(mean=mu, sigma=sigma))
+
+
+def _sample_fee_from_calibration(
+    calibration: dict,
+    regime_pair: str,
+    ptype: str,
+    rng,
+    weighting: str,
+) -> float:
+    key = f"{regime_pair} | {ptype}"
+    probs = _lookup_prob_table(calibration, "fee_given_ptype_and_regime_pair", key, weighting)
+    if probs:
+        sampled = _sample_from_prob_dict(rng, probs)
+        return float(sampled)
+
+    # robust fallbacks
+    if ptype == "univ2":
+        return 0.003
+    if ptype == "curve":
+        return 0.0004
+    if ptype == "univ3_proxy":
+        return 0.003
+    if ptype == "bal_wgm":
+        return 0.0025
+    return 0.003
+
+
+def _get_univ3_proxy_params(calibration: dict, regime_pair: str, fee: float) -> tuple[float, float]:
+    priors = calibration.get("metadata", {}).get("univ3_proxy_priors", {})
+    regime_priors = priors.get(regime_pair, {})
+    if not regime_priors:
+        return 0.25, 0.60
+
+    nearest_key = _nearest_numeric_key(regime_priors, fee)
+    if nearest_key is None:
+        return 0.25, 0.60
+
+    params = regime_priors[nearest_key]
+    alpha = float(params.get("alpha", 0.25))
+    beta = float(params.get("beta", 0.60))
+    return alpha, beta
+
+
+def _get_curve_k(calibration: dict, regime_pair: str) -> float:
+    return float(
+        calibration.get("metadata", {})
+        .get("curve_k_by_regime_pair", {})
+        .get(regime_pair, 0.2)
+    )
+
+
+def _get_bal_weights(calibration: dict) -> tuple[float, float]:
+    defaults = calibration.get("metadata", {}).get("bal_wgm_defaults", {})
+    return float(defaults.get("w_i", 0.5)), float(defaults.get("w_j", 0.5))
+
+
+def _initial_role_probs() -> dict[str, float]:
+    try:
+        calibration = load_calibration(str(CALIBRATION_PATH))
+        return _normalize_prob_dict(calibration["role_probs"])
+    except Exception:
+        # fallback only for import-time convenience
+        return {"core": 0.08, "mid": 0.17, "periphery": 0.75}
+
+
 @dataclass(frozen=True)
 class TopologyPreset:
     role_probs: dict[str, float]
@@ -45,21 +230,20 @@ class TopologyPreset:
     pareto_alpha: float
 
 
-# Research hypothesis:
-# Denser token-exchange connectivity should reduce routing cost across token
-# categories by increasing the number and quality of feasible paths available to
-# the solver. We evaluate that hypothesis by holding the non-topological layers
-# fixed and comparing topology presets using category-level lowest-cost curves
-# and routing-behavior summaries.
-DEFAULT_ROLE_PROBS: dict[str, float] = {"core": 0.08, "mid": 0.17, "periphery": 0.75}
+DEFAULT_ROLE_PROBS: dict[str, float] = _initial_role_probs()
 DEFAULT_DEGREE_CORRECTION = True
 DEFAULT_PARETO_ALPHA = 2.5
 DEFAULT_PAIR_SAMPLING_POLICY = PairSamplingPolicy(mode="all")
-TOKEN_TYPES: tuple[str, ...] = ("stable", "major", "alt", "meme")
-DEFAULT_TRADE_SIZE_GRID: tuple[float, ...] = tuple(float(dx) for dx in np.geomspace(1000, 140000000.0, num=25))
-DEFAULT_SEEDS: tuple[int, ...] = tuple(range(3, 9))  # 24 seeds
+
+# keep framework-compatible field name token_type, but values are now value regimes
+TOKEN_TYPES: tuple[str, ...] = ("usd_like", "volatile")
+
+DEFAULT_TRADE_SIZE_GRID: tuple[float, ...] = tuple(
+    float(dx) for dx in np.geomspace(1000, 140000000.0, num=25)
+)
+DEFAULT_SEEDS: tuple[int, ...] = tuple(range(3, 9))
 MARGINAL_AVG_PRICE_FLOOR = 1e-9
-FRONTIER_PAIR_COST_QUANTILE = 0.50  # robust "best-route frontier" within each seed/category/dx
+FRONTIER_PAIR_COST_QUANTILE = 0.50
 DEFAULT_OUTPUT_DIR = Path("outputs/experiment_01_network_typology")
 RAW_OUTPUT_FILENAME = "raw_simulation_output.json.gz"
 MANIFEST_FILENAME = "run_manifest.json"
@@ -122,12 +306,17 @@ TOPOLOGY_PRESETS: dict[str, TopologyPreset] = {
 
 
 def build_generator(config: ExperimentConfig, seed: int) -> SBMGenerator:
+    calibration = load_calibration(str(config.fixed_parameters["calibration_path"]))
+    weighting = str(config.fixed_parameters.get("calibration_weighting", CALIBRATION_WEIGHTING))
+
     preset_name = str(config.fixed_parameters["topology_preset"])
     preset = TOPOLOGY_PRESETS[preset_name]
 
+    role_probs = _normalize_prob_dict(config.fixed_parameters["role_probs"])
+
     role_cfg = RoleSBMConfig(
-        n_nodes=int(config.fixed_parameters["n_nodes"]),
-        role_probs=preset.role_probs,
+        n_nodes=30,
+        role_probs=role_probs,
         role_connectivity=preset.role_connectivity,
         degree_correction=preset.degree_correction,
         pareto_alpha=preset.pareto_alpha,
@@ -137,15 +326,10 @@ def build_generator(config: ExperimentConfig, seed: int) -> SBMGenerator:
 
     def token_type_sampler(node, graph, rng):
         role = graph.nodes[node]["role"]
-        conditional_probs = {
-            "core": {"stable": 0.45, "major": 0.45, "alt": 0.1, "meme": 0.0},
-            "mid": {"stable": 0.1, "major": 0.4, "alt": 0.4, "meme": 0.1},
-            "periphery": {"stable": 0.02, "major": 0.08, "alt": 0.55, "meme": 0.35},
-        }
-        types = list(conditional_probs[role].keys())
-        probs = np.array(list(conditional_probs[role].values()), dtype=float)
-        probs /= probs.sum()
-        return str(rng.choice(types, p=probs))
+        probs = _lookup_prob_table(calibration, "value_regime_given_role", role, weighting)
+        if not probs:
+            probs = {"usd_like": 0.5, "volatile": 0.5}
+        return _sample_from_prob_dict(rng, probs)
 
     node_model = NodeAttributeModel(
         {"token_type": NodeAttributeRule("token_type", token_type_sampler)},
@@ -155,31 +339,91 @@ def build_generator(config: ExperimentConfig, seed: int) -> SBMGenerator:
     def amm_sampler(i, j, graph, rng):
         ti = graph.nodes[i]["token_type"]
         tj = graph.nodes[j]["token_type"]
-        if ti == "stable" and tj == "stable":
-            return str(rng.choice(["curve", "univ2"], p=[0.9, 0.1]))
-        return "univ2"
+        regime_pair = "__".join(sorted([ti, tj]))
+
+        probs = _lookup_prob_table(calibration, "ptype_given_regime_pair", regime_pair, weighting)
+        if not probs:
+            if regime_pair == "usd_like__usd_like":
+                probs = {"curve": 0.5, "univ2": 0.25, "univ3_proxy": 0.25}
+            else:
+                probs = {"univ2": 0.6, "univ3_proxy": 0.4}
+
+        return _sample_from_prob_dict(rng, probs)
 
     def liquidity_sampler(i, j, graph, rng):
-        base = {"core": 5e6, "mid": 1e6, "periphery": 2e5}
+        ti = graph.nodes[i]["token_type"]
+        tj = graph.nodes[j]["token_type"]
         ri = graph.nodes[i]["role"]
         rj = graph.nodes[j]["role"]
-        scale = (base[ri] + base[rj]) / 2
-        return float(scale * rng.lognormal(mean=0, sigma=0.4))
+        ptype = graph.edges[i, j]["amm"]
+
+        regime_pair = "__".join(sorted([ti, tj]))
+        role_pair = "__".join(sorted([ri, rj]))
+
+        bucket = _find_liquidity_bucket(calibration, role_pair, ptype, regime_pair)
+        return _sample_lognormal_from_bucket(rng, bucket, default_mean=1e6, default_sigma=0.7)
 
     def fee_sampler(i, j, graph, rng):
-        return float(rng.integers(1, 10) / 1000)
+        ti = graph.nodes[i]["token_type"]
+        tj = graph.nodes[j]["token_type"]
+        ptype = graph.edges[i, j]["amm"]
+        regime_pair = "__".join(sorted([ti, tj]))
+        return _sample_fee_from_calibration(calibration, regime_pair, ptype, rng, weighting)
 
-    def a_sampler(i, j, graph, rng):
-        if graph.edges[i, j]["amm"] == "curve":
-            return int(rng.integers(500, 1200))
-        return None
+    def alpha_sampler(i, j, graph, rng):
+        if graph.edges[i, j]["amm"] != "univ3_proxy":
+            return 0.25
+        ti = graph.nodes[i]["token_type"]
+        tj = graph.nodes[j]["token_type"]
+        regime_pair = "__".join(sorted([ti, tj]))
+        fee = float(graph.edges[i, j]["fee"])
+        alpha, _ = _get_univ3_proxy_params(calibration, regime_pair, fee)
+        return float(alpha)
+
+
+    def beta_sampler(i, j, graph, rng):
+        if graph.edges[i, j]["amm"] != "univ3_proxy":
+            return 0.60
+        ti = graph.nodes[i]["token_type"]
+        tj = graph.nodes[j]["token_type"]
+        regime_pair = "__".join(sorted([ti, tj]))
+        fee = float(graph.edges[i, j]["fee"])
+        _, beta = _get_univ3_proxy_params(calibration, regime_pair, fee)
+        return float(beta)
+
+
+    def k_sampler(i, j, graph, rng):
+        if graph.edges[i, j]["amm"] != "curve":
+            return 0.20
+        ti = graph.nodes[i]["token_type"]
+        tj = graph.nodes[j]["token_type"]
+        regime_pair = "__".join(sorted([ti, tj]))
+        return float(_get_curve_k(calibration, regime_pair))
+
+
+    def wi_sampler(i, j, graph, rng):
+        if graph.edges[i, j]["amm"] != "bal_wgm":
+            return 0.5
+        w_i, _ = _get_bal_weights(calibration)
+        return float(w_i)
+
+
+    def wj_sampler(i, j, graph, rng):
+        if graph.edges[i, j]["amm"] != "bal_wgm":
+            return 0.5
+        _, w_j = _get_bal_weights(calibration)
+        return float(w_j)
 
     edge_model = EdgeAttributeModel(
         {
             "amm": EdgeAttributeRule("amm", amm_sampler),
             "liquidity": EdgeAttributeRule("liquidity", liquidity_sampler),
             "fee": EdgeAttributeRule("fee", fee_sampler),
-            "A": EdgeAttributeRule("A", a_sampler),
+            "alpha": EdgeAttributeRule("alpha", alpha_sampler),
+            "beta": EdgeAttributeRule("beta", beta_sampler),
+            "k": EdgeAttributeRule("k", k_sampler),
+            "w_i": EdgeAttributeRule("w_i", wi_sampler),
+            "w_j": EdgeAttributeRule("w_j", wj_sampler),
         },
         seed=seed + 2,
     )
@@ -193,11 +437,16 @@ def build_experiment_config(
     seeds: tuple[int, ...] = DEFAULT_SEEDS,
     pair_sampling_policy: PairSamplingPolicy = DEFAULT_PAIR_SAMPLING_POLICY,
     trade_size_grid: tuple[float, ...] = DEFAULT_TRADE_SIZE_GRID,
+    calibration_path: Path = CALIBRATION_PATH,
+    calibration_weighting: str = CALIBRATION_WEIGHTING,
 ) -> ExperimentConfig:
     if topology_preset not in TOPOLOGY_PRESETS:
         raise KeyError(f"Unknown topology preset: {topology_preset}")
 
     preset = TOPOLOGY_PRESETS[topology_preset]
+    calibration = load_calibration(str(calibration_path))
+    empirical_role_probs = _normalize_prob_dict(calibration["role_probs"])
+
     return ExperimentConfig(
         varied_parameter=VariedParameter(name="topology_preset", value=topology_preset),
         fixed_parameters={
@@ -205,7 +454,9 @@ def build_experiment_config(
             "topology_preset": topology_preset,
             "degree_correction": preset.degree_correction,
             "pareto_alpha": preset.pareto_alpha,
-            "role_probs": dict(preset.role_probs),
+            "role_probs": empirical_role_probs,
+            "calibration_path": str(calibration_path),
+            "calibration_weighting": calibration_weighting,
         },
         seeds=tuple(seeds),
         pair_sampling_policy=pair_sampling_policy,
@@ -218,7 +469,9 @@ def build_experiment_config(
     )
 
 
-def build_exchange_route_categories(token_types: tuple[str, ...] = TOKEN_TYPES) -> tuple[CategoryDefinition, ...]:
+def build_exchange_route_categories(
+    token_types: tuple[str, ...] = TOKEN_TYPES,
+) -> tuple[CategoryDefinition, ...]:
     return tuple(
         CategoryDefinition(
             name=f"{source_token_type}->{target_token_type}",
@@ -391,6 +644,8 @@ def collect_typology_outputs(
     trade_size_grid: tuple[float, ...] = DEFAULT_TRADE_SIZE_GRID,
     n_nodes: int = 28,
     pair_sampling_policy: PairSamplingPolicy = DEFAULT_PAIR_SAMPLING_POLICY,
+    calibration_path: Path = CALIBRATION_PATH,
+    calibration_weighting: str = CALIBRATION_WEIGHTING,
 ) -> dict[str, object]:
     pair_metrics_rows: list[dict[str, float | int | str]] = []
     category_metrics_rows: list[dict[str, float | int | str]] = []
@@ -407,6 +662,8 @@ def collect_typology_outputs(
             seeds=seeds,
             pair_sampling_policy=pair_sampling_policy,
             trade_size_grid=trade_size_grid,
+            calibration_path=calibration_path,
+            calibration_weighting=calibration_weighting,
         )
         experiment_result = run_experiment(config, build_generator)
         raw_results_by_preset[topology_preset] = {
@@ -416,6 +673,8 @@ def collect_typology_outputs(
                     "value": config.varied_parameter.value,
                 },
                 "fixed_parameters": dict(config.fixed_parameters),
+                "calibration_path": str(config.fixed_parameters["calibration_path"]),
+                "calibration_weighting": str(config.fixed_parameters["calibration_weighting"]),
                 "seeds": list(config.seeds),
                 "pair_sampling_policy": {
                     "mode": config.pair_sampling_policy.mode,
@@ -616,8 +875,6 @@ def collect_typology_outputs(
                 "seed": seed,
                 "category": category,
                 "dx": dx,
-                # Backward-compatible column name retained, but now computed as a
-                # robust lower-envelope (quantile frontier) instead of raw minimum.
                 "lowest_marginal_cost": frontier_cost,
                 "pair_median_marginal_cost": pair_median_cost,
                 "pair_count": int(costs.size),
@@ -1122,8 +1379,17 @@ def write_run_manifest(
     return manifest_path
 
 
-def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, object]:
-    analysis_payload = collect_typology_outputs(output_dir)
+def run_typology_analysis(
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    *,
+    calibration_path: Path = CALIBRATION_PATH,
+    calibration_weighting: str = CALIBRATION_WEIGHTING,
+) -> dict[str, object]:
+    analysis_payload = collect_typology_outputs(
+        output_dir,
+        calibration_path=calibration_path,
+        calibration_weighting=calibration_weighting,
+    )
     raw_output_path = output_dir / RAW_OUTPUT_FILENAME
     _write_json_gz(
         raw_output_path,
@@ -1183,7 +1449,7 @@ def run_typology_analysis(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict[str, ob
 def main() -> int:
     run_typology_analysis()
 
-    # Resource-light smoke configuration for local testing (keep commented out):
+    # Smoke-test example:
     # small_output_dir = Path("outputs/experiment_01_network_typology_smoke")
     # analysis_payload = collect_typology_outputs(
     #     small_output_dir,
@@ -1192,6 +1458,8 @@ def main() -> int:
     #     trade_size_grid=(1.0, 10.0, 100.0),
     #     n_nodes=14,
     #     pair_sampling_policy=PairSamplingPolicy(mode="sample", max_pairs_per_category=24),
+    #     calibration_path=CALIBRATION_PATH,
+    #     calibration_weighting=CALIBRATION_WEIGHTING,
     # )
     # plot_lowest_marginal_cost_grid(analysis_payload["lowest_marginal_cost_rows"], small_output_dir)
 
