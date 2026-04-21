@@ -68,6 +68,7 @@ class RoutingConfig:
     objective: Literal["max_out"] = "max_out"
     solver: Literal["ECOS", "OSQP", "SCS", "CLARABEL"] = "ECOS"
     solver_opts: Dict[str, Any] = field(default_factory=dict)
+    diagnostic_logging: bool = False
 
 
 @dataclass(frozen=True)

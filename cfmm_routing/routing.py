@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import time
 from typing import Dict, List, Tuple
 
 import numpy as np
 import cvxpy as cp
 
 from cfmm_routing.config import RoutingConfig, PoolSpec
+
+_LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class Market:
@@ -42,6 +46,39 @@ class _CompiledMaxOutProblem:
     lambdas: List[cp.Variable]
     local_assets_list: List[List[int]]
     prob: cp.Problem
+
+
+def _solver_opts_for(solver: str, solver_opts: Dict[str, object]) -> Dict[str, object]:
+    """Normalize generic solver options to backend-specific CVXPY kwargs."""
+    opts: Dict[str, object] = dict(solver_opts)
+
+    if solver == "CLARABEL":
+        # Clarabel expects singular `max_iter` and different tolerance names.
+        if "max_iters" in opts and "max_iter" not in opts:
+            opts["max_iter"] = opts.pop("max_iters")
+        if "eps" in opts:
+            eps = opts.pop("eps")
+            if "tol_gap_abs" not in opts:
+                opts["tol_gap_abs"] = eps
+            if "tol_gap_rel" not in opts:
+                opts["tol_gap_rel"] = eps
+            if "tol_feas" not in opts:
+                opts["tol_feas"] = eps
+        return opts
+
+    if solver == "ECOS":
+        # ECOS does not accept a generic `eps` kwarg; map to its tolerances.
+        if "eps" in opts:
+            eps = opts.pop("eps")
+            if "abstol" not in opts:
+                opts["abstol"] = eps
+            if "reltol" not in opts:
+                opts["reltol"] = eps
+            if "feastol" not in opts:
+                opts["feastol"] = eps
+        return opts
+
+    return opts
 
 
 def _pool_local_assets(p: PoolSpec) -> List[int]:
@@ -289,13 +326,40 @@ def _solve_compiled_max_out_problem(
     status = "error"
     for solver in solvers_to_try:
         selected_solver = solver
+        solver_opts = _solver_opts_for(solver, rcfg.solver_opts)
+        started_at = time.perf_counter()
+        if rcfg.diagnostic_logging:
+            _LOGGER.info(
+                "Routing solve attempt: dx=%s solver=%s opts=%s",
+                dx_total,
+                solver,
+                solver_opts,
+            )
         try:
-            compiled.prob.solve(solver=solver, warm_start=True, **rcfg.solver_opts)
+            compiled.prob.solve(solver=solver, warm_start=True, **solver_opts)
         except Exception as e:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             solve_errors.append({"solver": solver, "exception": repr(e)})
+            if rcfg.diagnostic_logging:
+                _LOGGER.exception(
+                    "Routing solver failed: dx=%s solver=%s elapsed_ms=%.2f",
+                    dx_total,
+                    solver,
+                    elapsed_ms,
+                )
             continue
 
         status = str(compiled.prob.status)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        if rcfg.diagnostic_logging:
+            _LOGGER.info(
+                "Routing solver completed: dx=%s solver=%s status=%s elapsed_ms=%.2f objective=%s",
+                dx_total,
+                solver,
+                status,
+                elapsed_ms,
+                compiled.prob.value,
+            )
         if compiled.prob.value is not None and status in ("optimal", "optimal_inaccurate"):
             break
 

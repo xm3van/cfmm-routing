@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import math
+import os
 import platform
 import subprocess
 import sys
@@ -48,6 +50,7 @@ from cfmm_routing.sbm import (
 
 CALIBRATION_PATH = Path("outputs/geckoterminal_calibration_experiment/calibration.json")
 CALIBRATION_WEIGHTING = "liquidity_weighted"  # or "count_weighted"
+LOGGER = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=4)
@@ -68,6 +71,23 @@ def _normalize_prob_dict(d: dict[str, float]) -> dict[str, float]:
         n = len(d)
         return {str(k): 1.0 / n for k in d}
     return {str(k): float(v) / total for k, v in d.items()}
+
+
+def _configure_logging_from_env() -> None:
+    enabled = os.environ.get("CFMM_EXPERIMENT_LOG", "").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return
+
+    level_name = os.environ.get("CFMM_EXPERIMENT_LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    LOGGER.info(
+        "Diagnostic logging enabled (level=%s). Set CFMM_EXPERIMENT_LOG=0 to disable.",
+        logging.getLevelName(level),
+    )
 
 
 def _sample_from_prob_dict(rng, probs: dict[str, float]) -> str:
@@ -465,6 +485,7 @@ def build_experiment_config(
         routing_config=RoutingConfig(
             solver="SCS",
             solver_opts={"max_iters": 5000, "eps": 1e-5, "verbose": False},
+            diagnostic_logging=os.environ.get("CFMM_EXPERIMENT_LOG", "").strip().lower() in {"1", "true", "yes", "on"},
         ),
     )
 
@@ -1447,6 +1468,7 @@ def run_typology_analysis(
 
 
 def main() -> int:
+    _configure_logging_from_env()
     run_typology_analysis()
 
     # Smoke-test example:
