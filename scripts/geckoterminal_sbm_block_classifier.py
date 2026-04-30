@@ -138,6 +138,8 @@ EDGE_CSV_NAME = "network_edges.csv"
 FIT_CSV_NAME = "graspologic_model_selection.csv"
 ROLE_CSV_NAME = "graspologic_node_roles.csv"
 BLOCK_CSV_NAME = "graspologic_block_summary.csv"
+BLOCK_PRIORS_BY_K_CSV_NAME = "graspologic_block_priors_by_k.csv"
+BLOCK_MATRIX_BY_K_CSV_NAME = "graspologic_block_matrix_by_k.csv"
 
 
 # ============================================================
@@ -487,6 +489,74 @@ def draw_model_selection(fit_df: pd.DataFrame, best_k: int, out_png: Path):
 # COMPLEXITY INFERENCE
 # ============================================================
 
+def _compute_block_priors_rows(labels: np.ndarray, k: int) -> list[dict]:
+    counts = pd.Series(labels).value_counts().sort_index()
+    n_total = len(labels)
+
+    rows = []
+    for cluster in range(k):
+        n_nodes = int(counts.get(cluster, 0))
+        block_prior_pi = float(n_nodes / n_total) if n_total > 0 else 0.0
+        rows.append(
+            {
+                "k": int(k),
+                "cluster": int(cluster),
+                "n_nodes": n_nodes,
+                "block_prior_pi": block_prior_pi,
+            }
+        )
+    return rows
+
+
+def _compute_block_matrix_rows(
+    H: nx.Graph,
+    nodelist: list,
+    labels: np.ndarray,
+    k: int,
+) -> list[dict]:
+    block_nodes = {cluster: [] for cluster in range(k)}
+    for idx, node in enumerate(nodelist):
+        block_nodes[int(labels[idx])].append(node)
+
+    node_to_idx = {node: idx for idx, node in enumerate(nodelist)}
+
+    edge_counts = defaultdict(int)
+    for u, v in H.edges():
+        r = int(labels[node_to_idx[u]])
+        s = int(labels[node_to_idx[v]])
+        if r <= s:
+            edge_counts[(r, s)] += 1
+        else:
+            edge_counts[(s, r)] += 1
+
+    rows = []
+    for r in range(k):
+        n_r = len(block_nodes[r])
+        for s in range(r, k):
+            n_s = len(block_nodes[s])
+            edges_observed = int(edge_counts.get((r, s), 0))
+
+            if r == s:
+                pairs_possible = int(n_r * (n_r - 1) / 2)
+            else:
+                pairs_possible = int(n_r * n_s)
+
+            p_edge = float(edges_observed / pairs_possible) if pairs_possible > 0 else 0.0
+
+            rows.append(
+                {
+                    "k": int(k),
+                    "block_r": int(r),
+                    "block_s": int(s),
+                    "edges_observed": edges_observed,
+                    "pairs_possible": pairs_possible,
+                    "p_edge": p_edge,
+                }
+            )
+
+    return rows
+
+
 def infer_complexity_graspologic(G: nx.Graph):
     H = G.copy()
 
@@ -520,6 +590,8 @@ def infer_complexity_graspologic(G: nx.Graph):
 
     fit_rows = []
     label_store = {}
+    all_block_priors_rows = []
+    all_block_matrix_rows = []
 
     for k in CLUSTER_RANGE:
         gm = GaussianMixture(
@@ -532,6 +604,8 @@ def infer_complexity_graspologic(G: nx.Graph):
         gm.fit(X_scaled)
         labels = gm.predict(X_scaled)
         counts = pd.Series(labels).value_counts().sort_index()
+        all_block_priors_rows.extend(_compute_block_priors_rows(labels, k))
+        all_block_matrix_rows.extend(_compute_block_matrix_rows(H, nodelist, labels, k))
 
         fit_rows.append(
             {
@@ -619,6 +693,9 @@ def infer_complexity_graspologic(G: nx.Graph):
         .sort_values(["mean_core_number", "mean_degree", "total_liquidity_usd"], ascending=False)
     )
 
+    block_priors_by_k = pd.DataFrame(all_block_priors_rows)
+    block_matrix_by_k = pd.DataFrame(all_block_matrix_rows)
+
     return {
         "fit_df": fit_df,
         "valid_df": valid_df.sort_values("bic").reset_index(drop=True),
@@ -627,6 +704,8 @@ def infer_complexity_graspologic(G: nx.Graph):
             ascending=[True, False, False],
         ).reset_index(drop=True),
         "block_summary": block_summary.reset_index(drop=True),
+        "block_priors_by_k": block_priors_by_k.reset_index(drop=True),
+        "block_matrix_by_k": block_matrix_by_k.reset_index(drop=True),
         "best_k": best_k,
     }
 
@@ -658,6 +737,8 @@ def main():
     out_fit = outdir / FIT_CSV_NAME
     out_roles = outdir / ROLE_CSV_NAME
     out_blocks = outdir / BLOCK_CSV_NAME
+    out_block_priors_by_k = outdir / BLOCK_PRIORS_BY_K_CSV_NAME
+    out_block_matrix_by_k = outdir / BLOCK_MATRIX_BY_K_CSV_NAME
 
     draw_static(H, out_png)
 
@@ -696,11 +777,15 @@ def main():
     valid_df = results["valid_df"]
     node_roles = results["node_df"]
     block_summary = results["block_summary"]
+    block_priors_by_k = results["block_priors_by_k"]
+    block_matrix_by_k = results["block_matrix_by_k"]
     best_k = results["best_k"]
 
     fit_df.to_csv(out_fit, index=False)
     node_roles.to_csv(out_roles, index=False)
     block_summary.to_csv(out_blocks, index=False)
+    block_priors_by_k.to_csv(out_block_priors_by_k, index=False)
+    block_matrix_by_k.to_csv(out_block_matrix_by_k, index=False)
 
     draw_clustered_network(H, node_roles, out_cluster_png)
     draw_model_selection(fit_df, best_k, out_model_png)
@@ -722,6 +807,25 @@ def main():
     print("\n=== BLOCK SUMMARY ===")
     print(block_summary.to_string(index=False))
 
+    for k in sorted(block_priors_by_k["k"].unique()):
+        priors_k = (
+            block_priors_by_k[block_priors_by_k["k"] == k][["cluster", "n_nodes", "block_prior_pi"]]
+            .sort_values(["cluster"])
+            .copy()
+        )
+        priors_k["block_prior_pi"] = priors_k["block_prior_pi"].round(4)
+
+        matrix_k = (
+            block_matrix_by_k[block_matrix_by_k["k"] == k][["block_r", "block_s", "p_edge"]]
+            .sort_values(["block_r", "block_s"])
+            .copy()
+        )
+        matrix_k["p_edge"] = matrix_k["p_edge"].round(4)
+
+        print(f"\n=== STRUCTURE k={k} ===")
+        print(priors_k.to_string(index=False))
+        print(matrix_k.to_string(index=False))
+
     print(f"\nWrote: {out_png}")
     print(f"Wrote: {out_cluster_png}")
     print(f"Wrote: {out_model_png}")
@@ -730,6 +834,8 @@ def main():
     print(f"Wrote: {out_fit}")
     print(f"Wrote: {out_roles}")
     print(f"Wrote: {out_blocks}")
+    print(f"Wrote: {out_block_priors_by_k}")
+    print(f"Wrote: {out_block_matrix_by_k}")
     print(f"Final graph: {H.number_of_nodes()} nodes, {H.number_of_edges()} edges")
 
 
