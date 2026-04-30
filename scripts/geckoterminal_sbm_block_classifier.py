@@ -132,6 +132,7 @@ SAVEFIG_DPI = 220
 NETWORK_PNG_NAME = "ethereum_pool_network.png"
 CLUSTERED_NETWORK_PNG_NAME = "ethereum_pool_network_clustered.png"
 MODEL_SELECTION_PNG_NAME = "graspologic_model_selection.png"
+BLOCK_MATRIX_HEATMAPS_PNG_NAME = "graspologic_block_matrix_heatmaps.png"
 
 NODE_CSV_NAME = "network_nodes.csv"
 EDGE_CSV_NAME = "network_edges.csv"
@@ -485,6 +486,46 @@ def draw_model_selection(fit_df: pd.DataFrame, best_k: int, out_png: Path):
     plt.close()
 
 
+def draw_block_matrix_heatmaps(block_matrix_by_k: pd.DataFrame, out_png: Path):
+    k_values = sorted(int(k) for k in block_matrix_by_k["k"].unique())
+    n_panels = len(k_values)
+    if n_panels == 0:
+        return
+
+    n_cols = min(3, n_panels)
+    n_rows = int(np.ceil(n_panels / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax_idx, k in enumerate(k_values):
+        ax = axes[ax_idx]
+        matrix_k = block_matrix_by_k[block_matrix_by_k["k"] == k]
+        mat = np.zeros((k, k), dtype=float)
+
+        for _, row in matrix_k.iterrows():
+            r = int(row["block_r"])
+            s = int(row["block_s"])
+            p = float(row["p_edge"])
+            mat[r, s] = p
+            mat[s, r] = p
+
+        im = ax.imshow(mat, vmin=0.0, vmax=1.0, cmap="viridis")
+        ax.set_title(f"k = {k}")
+        ax.set_xlabel("block_s")
+        ax.set_ylabel("block_r")
+        ax.set_xticks(range(k))
+        ax.set_yticks(range(k))
+
+    for ax in axes[n_panels:]:
+        ax.axis("off")
+
+    fig.colorbar(im, ax=axes.tolist(), fraction=0.025, pad=0.02, label="p_edge")
+    fig.suptitle("Block-pair edge probabilities by candidate k", y=1.02)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=SAVEFIG_DPI, bbox_inches="tight")
+    plt.close()
+
+
 # ============================================================
 # COMPLEXITY INFERENCE
 # ============================================================
@@ -732,6 +773,7 @@ def main():
     out_png = outdir / NETWORK_PNG_NAME
     out_cluster_png = outdir / CLUSTERED_NETWORK_PNG_NAME
     out_model_png = outdir / MODEL_SELECTION_PNG_NAME
+    out_block_heatmaps_png = outdir / BLOCK_MATRIX_HEATMAPS_PNG_NAME
     out_nodes = outdir / NODE_CSV_NAME
     out_edges = outdir / EDGE_CSV_NAME
     out_fit = outdir / FIT_CSV_NAME
@@ -789,6 +831,7 @@ def main():
 
     draw_clustered_network(H, node_roles, out_cluster_png)
     draw_model_selection(fit_df, best_k, out_model_png)
+    draw_block_matrix_heatmaps(block_matrix_by_k, out_block_heatmaps_png)
 
     print("\n=== RAW MODEL SELECTION ===")
     print(fit_df.to_string(index=False))
@@ -829,6 +872,7 @@ def main():
     print(f"\nWrote: {out_png}")
     print(f"Wrote: {out_cluster_png}")
     print(f"Wrote: {out_model_png}")
+    print(f"Wrote: {out_block_heatmaps_png}")
     print(f"Wrote: {out_nodes}")
     print(f"Wrote: {out_edges}")
     print(f"Wrote: {out_fit}")
